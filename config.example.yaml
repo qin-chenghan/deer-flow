@@ -1379,6 +1379,12 @@ run_events:
 # default. Toggle via config.yaml or the DEERFLOW_LLM_IO_TRACE_ENABLED env var
 # (true / false). The env var only overrides `enabled`; per-section flags stay
 # in yaml.
+#
+# WARNING: enabling this writes full user messages, tool arguments (which may
+# include file contents, credentials, tokens, and PII), and complete model
+# responses to the log. Do NOT enable in production environments with
+# persistent log collection, log shipping, or shared log access. Keep on
+# local dev / ephemeral runs only.
 
 # llm_io_trace:
 #   enabled: false              # Master switch. When false the middleware is not mounted at all.
