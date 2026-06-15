@@ -16,7 +16,7 @@ from deerflow.config.llm_io_trace_config import LLMIOTraceConfig
 
 @pytest.fixture
 def mock_lead_agent_build(monkeypatch):
-    """Stub out heavy lead-agent dependencies so we can call _build_middlewares
+    """Stub out heavy lead-agent dependencies so we can call build_middlewares
     in isolation. The middleware list returned by create_agent is what we
     inspect — every other branch is mocked away.
     """
@@ -41,14 +41,14 @@ def mock_lead_agent_build(monkeypatch):
 
 
 def _build_middlewares_with_config(mock_lead_agent_build, monkeypatch, llm_io_config: LLMIOTraceConfig):
-    """Run the lead-agent _build_middlewares under a given llm_io_trace config
+    """Run the lead-agent build_middlewares under a given llm_io_trace config
     and return the resulting middleware list.
     """
     app_config = AppConfig.model_construct(llm_io_trace=llm_io_config)
     # also stub get_model_config to return a stub
     stub = mock_lead_agent_build
     app_config.get_model_config = lambda name: stub
-    return lead_agent_module._build_middlewares(config={"configurable": {}}, model_name="default-model", app_config=app_config)
+    return lead_agent_module.build_middlewares(config={"configurable": {}}, model_name="default-model", app_config=app_config)
 
 
 def test_middleware_not_mounted_by_default(mock_lead_agent_build, monkeypatch):
