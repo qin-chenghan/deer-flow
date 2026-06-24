@@ -1541,7 +1541,6 @@ run_events:
 #   print_tools: false          # Print tool definitions / schemas.
 #   print_response: true        # Print the model response.
 #   max_messages: 0            # When > 0, only the last N messages are printed (tail). 0 = print all.
-=======
 # SSO / OIDC Authentication (optional)
 # ============================================================================
 # Enable SSO login via any OIDC-compatible provider (Keycloak, Google, Azure AD, Okta, etc.).
