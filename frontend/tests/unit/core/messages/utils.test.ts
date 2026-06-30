@@ -612,7 +612,13 @@ describe("orphan tool messages", () => {
         tool_call_id: "call-x",
         content: "first delivery",
       },
-      // No terminal ai message — next event is a replay of the same tool message
+      // Terminal assistant group ends the turn and closes the processing group.
+      // Without this interleave the replayed t-1b would still take the
+      // unchanged happy path; with it, t-1b arrives when lastOpenGroup()
+      // returns null and must take the new fallback branch to be visible.
+      { id: "ai-2", type: "ai", content: "Done." },
+      // Replayed tool-result for the original tool_call — must reach the new
+      // else-if (groups.length > 0) branch instead of being dropped.
       {
         id: "t-1b",
         type: "tool",
@@ -624,11 +630,12 @@ describe("orphan tool messages", () => {
 
     const groups = getMessageGroups(messages);
     const allMessages = groups.flatMap((g) => g.messages);
-    const toolOccurrences = allMessages.filter(
-      (m) => m.id === "t-1a" || m.id === "t-1b",
-    );
-    // Both should be present (replay semantics are determined by id dedup at a
-    // higher layer; this test only asserts that orphan-replayed tool is reachable).
-    expect(toolOccurrences.length).toBeGreaterThanOrEqual(1);
+
+    // Strict assertion: the replayed tool message must be reachable from a
+    // group (i.e. attached via the new fallback). Before the fix this was
+    // silently dropped by console.error.
+    const t1b = allMessages.find((m) => m.id === "t-1b");
+    expect(t1b).toBeDefined();
+    expect(t1b?.type).toBe("tool");
   });
 });
