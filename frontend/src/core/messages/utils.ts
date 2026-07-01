@@ -79,7 +79,7 @@ export function getMessageGroups(messages: Message[]): MessageGroup[] {
         const open = lastOpenGroup();
         if (open) {
           open.messages.push(message);
-        } else if (groups.length > 0) {
+        } else {
           // Fallback for orphan tool messages — LangGraph `messages-tuple` can
           // emit tool-result events out of order or replay them from subagent
           // state (e.g. bash subagent under LocalSandboxProvider with
@@ -88,15 +88,18 @@ export function getMessageGroups(messages: Message[]): MessageGroup[] {
           // dropped the message with console.error, silently hiding the tool
           // result from the UI. Attach to the most recent group instead so the
           // user can still see what the agent did.
-          groups[groups.length - 1].messages.push(message);
-        } else {
-          // groups is empty (shouldn't happen — the outer for loop is guarded
-          // by `messages.length === 0 -> return []`), but keep the diagnostic
-          // just in case.
-          console.error(
-            "Unexpected tool message with no preceding group",
-            message,
-          );
+          const lastGroup = groups[groups.length - 1];
+          if (lastGroup) {
+            lastGroup.messages.push(message);
+          } else {
+            // groups is empty (shouldn't happen — the outer for loop is guarded
+            // by `messages.length === 0 -> return []`), but keep the diagnostic
+            // just in case.
+            console.error(
+              "Unexpected tool message with no preceding group",
+              message,
+            );
+          }
         }
       }
       continue;
