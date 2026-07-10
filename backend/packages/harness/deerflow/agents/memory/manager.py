@@ -1,0 +1,322 @@
+"""Memory manager contract + pluggable backend factory.
+
+This module is the shared, backend-agnostic core of the memory package. It
+defines the :class:`MemoryManager` interface (9 methods) that every backend
+implements, plus a singleton :func:`get_memory_manager` factory that resolves
+the active backend from ``MemoryConfig.manager_class``.
+
+Swap backend = drop a ``backends/<name>/`` folder exposing ``MANAGER_CLASS``
+and set ``manager_class: <name>``. Nothing else in deer-flow changes.
+
+Scope note: this phase is *pluggable only*, not black-box. Agent-side
+conventions (``enabled`` gating at call sites, ``<memory>`` wrapping in
+``_get_memory_context``) stay where they are; they are backend-agnostic and
+do not impede pluggability.
+"""
+
+from __future__ import annotations
+
+import importlib
+import logging
+import threading
+from abc import ABC, abstractmethod
+from pathlib import Path
+from types import ModuleType
+from typing import Any
+
+from deerflow.config.memory_config import get_memory_config
+
+logger = logging.getLogger(__name__)
+
+# Backend packages live in <this dir>/backends/<name>/.
+_BACKENDS_DIR = Path(__file__).parent / "backends"
+# Sentinel attribute each backend's __init__ exposes (a MemoryManager subclass).
+_MANAGER_CLASS_ATTR = "MANAGER_CLASS"
+
+# Singleton instance + backend-registry cache (reset together by reset_memory_manager).
+# _manager_lock guards get_memory_manager()'s double-checked init (multi-threaded).
+_memory_manager: MemoryManager | None = None
+_backends_cache: dict[str, type[MemoryManager]] | None = None
+_manager_lock = threading.Lock()
+
+
+class MemoryManager(ABC):
+    """Backend-neutral memory manager contract (9 methods).
+
+    Memories are bucketed per ``(agent_name, user_id)``; ``thread_id`` aligns
+    with the deer-flow conversation thread. The contract is deliberately
+    neutral so a third-party memory system can be adapted without deer-flow
+    code changes:
+
+    - :meth:`get_context` returns plain injection text; the *format* is the
+      implementation's own choice and is NOT part of the contract (DeerMem
+      does load + ``format_memory_for_injection``; another backend may do
+      ``mem0.search`` + its own formatting).
+    - :meth:`add` / :meth:`add_nowait` take raw conversation messages; any
+      filtering / correction-/reinforcement-detection is the implementation's
+      private concern (not on the contract).
+    - No facts-model assumption: a backend need not store "facts" at all.
+
+    Methods marked *stub* are part of the contract but have no caller yet in
+    this phase; DeerMem raises ``NotImplementedError`` for them, a future
+    backend (or a later DeerMem ``core/`` module) may implement them for real.
+    """
+
+    def __init__(self, backend_config: dict[str, Any] | None = None) -> None:
+        """Receive backend-private config (the factory passes ``backend_config``).
+
+        Default stores the raw dict; backends that need to parse it (e.g. DeerMem
+        into a ``DeerMemConfig``) override ``__init__``. Backends that ignore
+        private config (e.g. noop) inherit this unchanged.
+        """
+        self._backend_config = backend_config
+
+    # ── Write ────────────────────────────────────────────────────────────
+    @abstractmethod
+    def add(
+        self,
+        thread_id: str,
+        messages: list[Any],
+        *,
+        agent_name: str | None = None,
+        user_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> None:
+        """Queue a conversation for memory update (debounced, asynchronous).
+
+        Args:
+            thread_id: Conversation thread id.
+            messages: Raw conversation messages; the implementation filters
+                to user inputs + final assistant responses itself.
+            agent_name: Per-agent bucket; ``None`` = global memory.
+            user_id: Per-user bucket.
+            trace_id: Request trace id captured for memory-LLM tracing.
+        """
+
+    @abstractmethod
+    def add_nowait(
+        self,
+        thread_id: str,
+        messages: list[Any],
+        *,
+        agent_name: str | None = None,
+        user_id: str | None = None,
+    ) -> None:
+        """Queue a conversation for *immediate* memory update (emergency flush).
+
+        Used right before summarization removes messages from state, so the
+        content is captured instead of lost.
+        """
+
+    # ── Read ─────────────────────────────────────────────────────────────
+    @abstractmethod
+    def get_context(
+        self,
+        user_id: str | None,
+        *,
+        agent_name: str | None = None,
+        thread_id: str | None = None,
+    ) -> str:
+        """Return injection-ready memory text for the given bucket.
+
+        Implementations load their memory and format it however they choose;
+        the returned string is injected verbatim by call sites. Format
+        parameters are the backend's own private config (received via
+        ``backend_config`` at construction), NOT a host config on this method.
+        """
+
+    @abstractmethod
+    def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        *,
+        user_id: str | None = None,
+        agent_name: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Semantic search over the bucket's memory. *stub* this phase (no caller yet)."""
+
+    # ── Manage ───────────────────────────────────────────────────────────
+    @abstractmethod
+    def get_memory(
+        self,
+        *,
+        user_id: str | None = None,
+        agent_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Return the full memory document for the bucket."""
+
+    @abstractmethod
+    def delete_memory(
+        self,
+        *,
+        user_id: str | None = None,
+        agent_name: str | None = None,
+    ) -> None:
+        """Delete the entire memory document for the bucket. *stub* this phase."""
+
+    @abstractmethod
+    def clear_memory(
+        self,
+        *,
+        user_id: str | None = None,
+        agent_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Clear the bucket's memory; return the cleared (now-empty) document."""
+
+    @abstractmethod
+    def import_memory(
+        self,
+        memory_data: dict[str, Any],
+        *,
+        user_id: str | None = None,
+        agent_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Import a memory document into the bucket; return the merged result."""
+
+    @abstractmethod
+    def export_memory(
+        self,
+        *,
+        user_id: str | None = None,
+        agent_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Export the memory document for the bucket. *stub* this phase (no caller yet)."""
+
+
+# ── Backend discovery (drop-in) ───────────────────────────────────────────
+def _scan_backends() -> dict[str, type[MemoryManager]]:
+    """Discover pluggable backends under ``backends/<name>/``.
+
+    Each subpackage that exposes a ``MANAGER_CLASS`` attribute (a
+    :class:`MemoryManager` subclass) is registered under its folder name.
+    Results are cached for the process. Folder name == backend name ==
+    ``manager_class`` config value (drop-in contract). A backend that fails
+    to import is logged and skipped so a broken optional backend never breaks
+    the factory.
+    """
+    global _backends_cache
+    if _backends_cache is not None:
+        return _backends_cache
+
+    registry: dict[str, type[MemoryManager]] = {}
+    if not _BACKENDS_DIR.is_dir():
+        _backends_cache = registry
+        return registry
+
+    for entry in sorted(_BACKENDS_DIR.iterdir()):
+        if not entry.is_dir() or entry.name.startswith(("_", ".")):
+            continue
+        if not (entry / "__init__.py").is_file():
+            continue
+        dotted = f"deerflow.agents.memory.backends.{entry.name}"
+        try:
+            module: ModuleType = importlib.import_module(dotted)
+        except Exception:  # noqa: BLE001 - a broken backend must not break the factory
+            logger.exception("Failed to import memory backend %r; skipping", entry.name)
+            continue
+        cls = getattr(module, _MANAGER_CLASS_ATTR, None)
+        if cls is None:
+            continue
+        if not (isinstance(cls, type) and issubclass(cls, MemoryManager)):
+            logger.warning(
+                "Memory backend %r exposes MANAGER_CLASS=%r which is not a MemoryManager subclass; skipping",
+                entry.name,
+                cls,
+            )
+            continue
+        registry[entry.name] = cls
+
+    _backends_cache = registry
+    return registry
+
+
+def _resolve_manager_class(manager_class: str) -> type[MemoryManager]:
+    """Resolve a ``manager_class`` config value to a concrete class.
+
+    Resolution order:
+      1. Registered short name (from :func:`_scan_backends`).
+      2. Dotted import path (``pkg.mod:Cls`` or ``pkg.mod.Cls``).
+      3. Fall back to DeerMem on any failure (the default backend).
+    """
+    registry = _scan_backends()
+    if manager_class in registry:
+        return registry[manager_class]
+
+    # Treat as a dotted path: support both "pkg.mod:Cls" and "pkg.mod.Cls".
+    try:
+        if ":" in manager_class:
+            module_path, _, attr = manager_class.partition(":")
+        else:
+            module_path, _, attr = manager_class.rpartition(".")
+        if module_path and attr:
+            module = importlib.import_module(module_path)
+            cls = getattr(module, attr)
+            if isinstance(cls, type) and issubclass(cls, MemoryManager):
+                return cls
+            logger.warning("manager_class path %r resolved to non-MemoryManager %r", manager_class, cls)
+    except Exception as e:  # noqa: BLE001 - a typo'd manager_class is a config error, not a crash; warn + fall back
+        logger.warning("Failed to resolve manager_class=%r as a dotted path; falling back to DeerMem: %s", manager_class, e)
+
+    # Fallback: DeerMem (the default backend). The default backend must be
+    # importable; if it is not there is no further fallback, so surface a clear
+    # error rather than a raw import traceback (mirrors the defensive style of
+    # get_memory_storage's fallback, which has a concrete default to fall to).
+    logger.warning("Falling back to DeerMem memory backend (manager_class=%r unresolved)", manager_class)
+    try:
+        from deerflow.agents.memory.backends.deermem.deer_mem import DeerMem
+    except Exception:  # noqa: BLE001
+        logger.exception("DeerMem default backend failed to import; no memory backend available")
+        raise RuntimeError("DeerMem default memory backend could not be imported") from None
+    return DeerMem
+
+
+# ── Singleton factory ─────────────────────────────────────────────────────
+def get_memory_manager() -> MemoryManager:
+    """Return the singleton :class:`MemoryManager` for the active config.
+
+    Reads ``MemoryConfig.manager_class`` and resolves it via
+    :func:`_resolve_manager_class`. The instance is cached; call
+    :func:`reset_memory_manager` to force re-resolution (tests / runtime
+    backend switching).
+    """
+    global _memory_manager
+    if _memory_manager is not None:
+        return _memory_manager
+
+    # deer-flow is multi-threaded: memory injection runs via asyncio.to_thread,
+    # the update queue fires on a Timer thread, and gateway/agent threads all
+    # reach here. Double-checked locking ensures only one instance is built even
+    # on first-call contention -- essential since backends now own stateful
+    # dependencies (DeerMem owns its storage/queue/updater; Mem0 would open
+    # connections) constructed here in __init__.
+    with _manager_lock:
+        if _memory_manager is not None:
+            return _memory_manager
+
+        cfg = get_memory_config()
+        manager_class = cfg.manager_class
+        cls = _resolve_manager_class(manager_class)
+        backend_config = dict(cfg.backend_config or {})
+        # Zero-config UX: default DeerMem storage to deer-flow's state dir
+        # (absolute, CWD-independent) so memory lands at
+        # {runtime_home}/users/{user_id}/memory.json (deer-flow's base_dir,
+        # same as pre-abstraction) unless the host explicitly sets storage_path.
+        if not backend_config.get("storage_path"):
+            from deerflow.config.runtime_paths import runtime_home
+            backend_config["storage_path"] = str(runtime_home())
+        _memory_manager = cls(backend_config=backend_config)
+        logger.info("Memory manager resolved: %s (manager_class=%r)", cls.__name__, manager_class)
+        return _memory_manager
+
+
+def reset_memory_manager() -> None:
+    """Clear the cached singleton manager and the backend registry.
+
+    The next :func:`get_memory_manager` call re-reads the config and re-scans
+    backends. Use this in tests or when switching backends at runtime.
+    """
+    global _memory_manager, _backends_cache
+    with _manager_lock:
+        _memory_manager = None
+        _backends_cache = None

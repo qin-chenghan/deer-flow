@@ -1,136 +1,49 @@
-"""Configuration for memory mechanism."""
+"""Configuration for the memory mechanism (host-shared fields only).
 
-from typing import Literal
+DeerMem-private fields live in ``backends/deermem/config.py`` (``DeerMemConfig``),
+reached via ``backend_config`` (a dict the factory passes to the backend's
+``__init__``). This module holds ONLY the host-shared fields every backend /
+call site / factory reads: ``enabled`` / ``injection_enabled`` /
+``manager_class`` / ``backend_config``. Keeping the shared schema slim is what
+makes backends swappable and portable (DeerMem's knobs do not leak onto the
+shared contract).
+"""
+
+from typing import Any
 
 from pydantic import BaseModel, Field
 
 
 class MemoryConfig(BaseModel):
-    """Configuration for global memory mechanism."""
+    """Host-shared memory configuration (backend-agnostic)."""
 
     enabled: bool = Field(
         default=True,
-        description="Whether to enable memory mechanism",
-    )
-    storage_path: str = Field(
-        default="",
-        description=(
-            "Path to store memory data. "
-            "If empty, defaults to per-user memory at `{base_dir}/users/{user_id}/memory.json`. "
-            "Absolute paths are used as-is and opt out of per-user isolation "
-            "(all users share the same file). "
-            "Relative paths are resolved against `Paths.base_dir` "
-            "(not the backend working directory). "
-            "Note: if you previously set this to `.deer-flow/memory.json`, "
-            "the file will now be resolved as `{base_dir}/.deer-flow/memory.json`; "
-            "migrate existing data or use an absolute path to preserve the old location."
-        ),
-    )
-    storage_class: str = Field(
-        default="deerflow.agents.memory.storage.FileMemoryStorage",
-        description="The class path for memory storage provider",
-    )
-    debounce_seconds: int = Field(
-        default=30,
-        ge=1,
-        le=300,
-        description="Seconds to wait before processing queued updates (debounce)",
-    )
-    model_name: str | None = Field(
-        default=None,
-        description="Model name to use for memory updates (None = use default model)",
-    )
-    max_facts: int = Field(
-        default=100,
-        ge=10,
-        le=500,
-        description="Maximum number of facts to store",
-    )
-    fact_confidence_threshold: float = Field(
-        default=0.7,
-        ge=0.0,
-        le=1.0,
-        description="Minimum confidence threshold for storing facts",
+        description="Whether to enable the memory mechanism (call-site gate).",
     )
     injection_enabled: bool = Field(
         default=True,
-        description="Whether to inject memory into system prompt",
+        description="Whether to inject memory into the system prompt (call-site gate).",
     )
-    max_injection_tokens: int = Field(
-        default=2000,
-        ge=100,
-        le=8000,
-        description="Maximum tokens to use for memory injection",
-    )
-    token_counting: Literal["tiktoken", "char"] = Field(
-        default="tiktoken",
+    manager_class: str = Field(
+        default="deermem",
         description=(
-            "Token counting strategy for memory-injection budgeting. "
-            "'tiktoken' is accurate but the encoding's BPE data may be "
-            "downloaded from a public network endpoint on first use, which "
-            "can block for a long time in network-restricted environments "
-            "(see issue #3402/#3429). 'char' uses a network-free "
-            "CJK-aware character-based estimate and never touches tiktoken."
+            "Memory backend selector. Either a registered backend name "
+            "(matching a `backends/<name>/` folder that exposes `MANAGER_CLASS`, "
+            "e.g. `deermem` / `noop`) or a dotted import path to a "
+            "`MemoryManager` subclass. The factory resolves this at "
+            "`get_memory_manager()` time and falls back to DeerMem on failure."
         ),
     )
-    guaranteed_categories: list[str] = Field(
-        default_factory=lambda: ["correction"],
+    backend_config: dict[str, Any] = Field(
+        default_factory=dict,
         description=(
-            "Fact categories that are always injected into the prompt regardless "
-            "of the regular token budget. These facts are allocated from a "
-            "separate reserved budget (``guaranteed_token_budget``). "
-            "This ensures high-value facts such as explicit user corrections "
-            "are never silently dropped when the token budget is tight."
+            "Backend-private config (a dict), passed verbatim to the backend's "
+            "`__init__(backend_config=...)` by the factory. Each backend "
+            "self-interprets it (DeerMem parses it into `DeerMemConfig`). Values "
+            "live in the host config file (`config.yaml` `memory.backend_config`); "
+            "they do not belong on the shared `MemoryConfig` schema."
         ),
-    )
-    guaranteed_token_budget: int = Field(
-        default=500,
-        ge=50,
-        le=2000,
-        description=(
-            "Token ceiling for guaranteed-category facts. "
-            "Guaranteed facts are selected first from this budget and placed at "
-            "the front of the Facts block so they cannot be evicted by regular "
-            "facts. In the common case the total output still fits within "
-            "``max_injection_tokens`` (guaranteed lines displace regular ones); "
-            "the budget becomes additive only when guaranteed lines alone push "
-            "the output past ``max_injection_tokens``, in which case the "
-            "safety-truncation ceiling is raised accordingly."
-        ),
-    )
-    # ── Staleness review ────────────────────────────────────────────────
-    staleness_review_enabled: bool = Field(
-        default=True,
-        description=(
-            "Enable staleness review for aged facts. When enabled, facts older "
-            "than ``staleness_age_days`` are surfaced in the memory-update prompt "
-            "so the LLM can semantically judge whether each is still valid or "
-            "should be removed. This solves the 'silent staleness' problem where "
-            "outdated facts persist because no future conversation explicitly "
-            "contradicts them."
-        ),
-    )
-    staleness_age_days: int = Field(
-        default=90,
-        ge=30,
-        le=365,
-        description=("Facts older than this many days become candidates for staleness review. 90 days (~one quarter) balances between catching genuine changes (job switches, tech-stack migrations) and avoiding noise on stable facts."),
-    )
-    staleness_min_candidates: int = Field(
-        default=3,
-        ge=1,
-        le=50,
-        description=("Minimum number of stale facts required to trigger a review cycle. Below this threshold the prompt overhead is not justified."),
-    )
-    staleness_max_removals_per_cycle: int = Field(
-        default=10,
-        ge=1,
-        le=50,
-        description=("Maximum number of facts the staleness review can remove in a single update cycle. Prevents the LLM from over-pruning when reviewing a large backlog of aged facts."),
-    )
-    staleness_protected_categories: list[str] = Field(
-        default_factory=lambda: ["correction"],
-        description=("Fact categories exempt from staleness review. Correction facts represent explicit user feedback and should not be auto-pruned based on age alone."),
     )
 
 
@@ -150,6 +63,10 @@ def set_memory_config(config: MemoryConfig) -> None:
 
 
 def load_memory_config_from_dict(config_dict: dict) -> None:
-    """Load memory configuration from a dictionary."""
+    """Load memory configuration from a dictionary.
+
+    DeerMem-private keys (from a not-yet-migrated config) are ignored -- they
+    must live under ``backend_config`` to reach the backend.
+    """
     global _memory_config
     _memory_config = MemoryConfig(**config_dict)

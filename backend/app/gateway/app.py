@@ -195,24 +195,26 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # When memory.token_counting is "char", token counting never touches
     # tiktoken, so skip the warm-up entirely (avoids even the 5s probe in
     # network-restricted deployments — see issue #3429).
-    if startup_config.memory.token_counting == "char":
-        logger.info("memory.token_counting='char'; skipping tiktoken warm-up (network-free token estimation)")
-    else:
-        try:
-            from deerflow.agents.memory.prompt import warm_tiktoken_cache
+    try:
+        from deerflow.agents.memory import get_memory_manager
 
+        manager = get_memory_manager()
+        warm = getattr(manager, "warm", None)
+        if not callable(warm):
+            logger.info("Memory backend %s has no warm-up hook; skipping tiktoken warm-up", type(manager).__name__)
+        else:
             warmed = await asyncio.wait_for(
-                asyncio.to_thread(warm_tiktoken_cache),
+                asyncio.to_thread(warm),
                 timeout=5,
             )
             if warmed:
                 logger.info("tiktoken encoding cache warmed successfully")
             else:
                 logger.warning("tiktoken encoding cache warm-up failed; token counting will use character-based fallback until tiktoken loads successfully")
-        except TimeoutError:
-            logger.warning("tiktoken encoding cache warm-up timed out; token counting will use character-based fallback until tiktoken loads successfully")
-        except Exception:
-            logger.warning("tiktoken warm-up skipped", exc_info=True)
+    except TimeoutError:
+        logger.warning("tiktoken encoding cache warm-up timed out; token counting will use character-based fallback until tiktoken loads successfully")
+    except Exception:
+        logger.warning("tiktoken warm-up skipped", exc_info=True)
 
     try:
         removed_upload_staging_files = await asyncio.to_thread(cleanup_stale_upload_staging_files)

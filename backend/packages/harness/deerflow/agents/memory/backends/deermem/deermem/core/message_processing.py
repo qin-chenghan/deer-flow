@@ -6,8 +6,6 @@ import re
 from copy import copy
 from typing import Any
 
-from deerflow.agents.human_input import read_human_input_response
-
 _UPLOAD_BLOCK_RE = re.compile(r"<uploaded_files>[\s\S]*?</uploaded_files>\n*", re.IGNORECASE)
 _CORRECTION_PATTERNS = (
     re.compile(r"\bthat(?:'s| is) (?:wrong|incorrect)\b", re.IGNORECASE),
@@ -55,8 +53,13 @@ def extract_message_text(message: Any) -> str:
     return str(content)
 
 
-def filter_messages_for_memory(messages: list[Any]) -> list[Any]:
-    """Keep only user inputs and final assistant responses for memory updates."""
+def filter_messages_for_memory(messages: list[Any], *, should_keep_hidden_message: Any = None) -> list[Any]:
+    """Keep only user inputs and final assistant responses for memory updates.
+
+    ``hide_from_ui`` messages are skipped by default (host-agnostic safe
+    default); pass a ``should_keep_hidden_message(additional_kwargs) -> bool``
+    hook to keep specific hidden messages (e.g. human-clarification responses).
+    """
     filtered = []
     skip_next_ai = False
     for msg in messages:
@@ -69,7 +72,10 @@ def filter_messages_for_memory(messages: list[Any]) -> list[Any]:
             # framework-internal text pollutes long-term memory (and the p0 __memory
             # payload could trigger a self-amplification loop).
             additional_kwargs = getattr(msg, "additional_kwargs", {}) or {}
-            if additional_kwargs.get("hide_from_ui") and read_human_input_response(additional_kwargs) is None:
+            if additional_kwargs.get("hide_from_ui") and (
+                should_keep_hidden_message is None
+                or not should_keep_hidden_message(additional_kwargs)
+            ):
                 continue
             content_str = extract_message_text(msg)
             if "<uploaded_files>" in content_str:
