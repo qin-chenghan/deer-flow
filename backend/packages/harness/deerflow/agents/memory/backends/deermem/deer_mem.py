@@ -170,8 +170,25 @@ class DeerMem(MemoryManager):
         user_id: str | None = None,
         agent_name: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Not implemented this phase (BM25+vector+MMR is a future ``core/retrieval.py``)."""
-        raise NotImplementedError("DeerMem.search is not implemented yet")
+        """Case-insensitive substring search over stored facts.
+
+        Stand-in for the planned BM25+vector+MMR retrieval
+        (``core/retrieval.py``): returns facts whose ``content`` contains the
+        query, ranked by confidence desc, capped at ``top_k``. Sufficient for
+        the tool-driven memory mode; upgrade to semantic retrieval later
+        without changing call sites.
+        """
+        if not query or not query.strip() or top_k <= 0:
+            return []
+        query_lower = query.strip().lower()
+        memory_data = self._updater.get_memory_data(agent_name=agent_name, user_id=user_id)
+        matched = [
+            fact
+            for fact in memory_data.get("facts", [])
+            if isinstance(fact.get("content"), str) and query_lower in fact["content"].lower()
+        ]
+        matched.sort(key=lambda f: f.get("confidence", 0), reverse=True)
+        return matched[:top_k]
 
     # ── Manage ───────────────────────────────────────────────────────────
     def get_memory(

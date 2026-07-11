@@ -1417,9 +1417,9 @@ memory:
   #   tool - experimental opt-in; the model calls memory_search/memory_add/
   #     memory_update/memory_delete directly. This gives the model agency over
   #     memory writes, but effectiveness depends on model tool-use behavior.
-  # Only one mode runs at a time. (tool mode targets the host memory module,
-  # which the pluggable-backends layout removed; it is inert here unless a
-  # backend re-exposes it.)
+  # Only one mode runs at a time. (tool mode calls the MemoryManager ABC --
+  # memory_search/add/update/delete go through the active backend; backends
+  # without fact-CRUD return a JSON error instead of crashing.)
   mode: middleware
   backend_config:
     storage_path: ""            # empty = deer-flow base_dir (factory injects absolute runtime_home)

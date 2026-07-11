@@ -87,11 +87,12 @@ def test_internal_capabilities_are_hasattr_probeable() -> None:
         assert not hasattr(noop, cap), cap
 
 
-def test_deermem_stubs_raise_not_implemented() -> None:
+def test_deermem_search_works_delete_export_are_stubs() -> None:
     set_memory_config(MemoryConfig(manager_class="deermem"))
     deermem = get_memory_manager()
-    with pytest.raises(NotImplementedError):
-        deermem.search("q", user_id="u")
+    # search is implemented (substring match) -- returns a list, does not raise.
+    assert isinstance(deermem.search("q", user_id="u"), list)
+    # delete_memory / export_memory remain unimplemented stubs this phase.
     with pytest.raises(NotImplementedError):
         deermem.delete_memory(user_id="u")
     with pytest.raises(NotImplementedError):

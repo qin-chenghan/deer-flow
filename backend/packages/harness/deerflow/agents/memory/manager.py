@@ -134,7 +134,7 @@ class MemoryManager(ABC):
         user_id: str | None = None,
         agent_name: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Semantic search over the bucket's memory. *stub* this phase (no caller yet)."""
+        """Search the bucket's memory for facts matching ``query``; return up to ``top_k`` ranked by relevance."""
 
     # ── Manage ───────────────────────────────────────────────────────────
     @abstractmethod
