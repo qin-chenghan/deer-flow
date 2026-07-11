@@ -9,7 +9,7 @@ makes backends swappable and portable (DeerMem's knobs do not leak onto the
 shared contract).
 """
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -20,6 +20,12 @@ class MemoryConfig(BaseModel):
     enabled: bool = Field(
         default=True,
         description="Whether to enable the memory mechanism (call-site gate).",
+    )
+    mode: Literal["middleware", "tool"] = Field(
+        default="middleware",
+        description=(
+            "Memory operation mode. 'middleware': passive LLM summarization after each turn (current behavior). 'tool': model calls memory tools (memory_search, memory_add, etc.) directly. Mutually exclusive — only one mode runs at a time."
+        ),
     )
     injection_enabled: bool = Field(
         default=True,
@@ -45,6 +51,11 @@ class MemoryConfig(BaseModel):
             "they do not belong on the shared `MemoryConfig` schema."
         ),
     )
+
+
+def should_use_memory_tools(config: MemoryConfig) -> bool:
+    """Return True when memory should use model-directed tools."""
+    return config.enabled and config.mode == "tool"
 
 
 # Global configuration instance

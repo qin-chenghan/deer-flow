@@ -4,6 +4,7 @@ import asyncio
 import atexit
 import concurrent.futures
 import copy
+import html
 import json
 import logging
 import math
@@ -436,10 +437,10 @@ def _build_consolidation_section(
         for fact in group[:max_sources]:
             fid = fact.get("id", "?")
             conf = _coerce_source_confidence(fact)
-            content = str(fact.get("content", ""))
+            content = html.escape(str(fact.get("content", "")))
             lines.append(f'- [{fid} | {conf:.2f}] "{content}"')
         shown = min(len(group), max_sources)
-        parts.append(f'<consolidation_candidates category="{cat}" count="{shown}">\n' + "\n".join(lines) + "\n</consolidation_candidates>")
+        parts.append(f'<consolidation_candidates category="{html.escape(cat)}" count="{shown}">\n' + "\n".join(lines) + "\n</consolidation_candidates>")
     return CONSOLIDATION_PROMPT.format(consolidation_groups="\n\n".join(parts), max_groups=max_groups)
 
 
