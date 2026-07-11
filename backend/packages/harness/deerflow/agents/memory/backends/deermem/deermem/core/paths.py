@@ -1,10 +1,8 @@
 """DeerMem's own storage path resolution (no deer-flow ``get_paths`` / ``AGENT_NAME_PATTERN``).
 
 The host no longer dictates where DeerMem stores data. Root = ``config.storage_path``
-(if set) or ``$DEERMEM_DATA_DIR`` or ``~/.deermem/``. An absolute
-``storage_path`` is treated as a single shared file (opts out of per-user
-isolation, preserving the original ``storage_path`` semantics); otherwise
-per-user / per-agent / legacy layouts live under the root, mirroring the
+(if set, absolute or relative) or ``$DEERMEM_DATA_DIR`` or ``~/.deermem/``.
+Per-user / per-agent / legacy layouts live under the root, mirroring the
 pre-abstraction paths so a one-time data migration (old ``{base_dir}/users/*``
 -> DeerMem root) is a plain move.
 

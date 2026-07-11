@@ -271,6 +271,61 @@ def _resolve_manager_class(manager_class: str) -> type[MemoryManager]:
     return DeerMem
 
 
+# ── Host-default hooks (injected into backend_config by the factory) ──────
+#
+# DeerMemConfig declares ``tracing_callback`` and ``should_keep_hidden_message``
+# as optional, host-agnostic slots (default ``None``). The portable package
+# never names a deer-flow concept, so the host fills these slots HERE -- in the
+# factory, which is host code outside ``backends/deermem/``. Backends whose
+# config schema declares these slots (DeerMem) consume them via
+# ``from_backend_config``'s known-field filter; others (mem0 / noop) ignore
+# them. An explicit value in ``backend_config`` (set programmatically) takes
+# precedence and is left untouched.
+#
+# Imports are lazy (matching the ``runtime_home`` precedent) so this module
+# stays cheap to import and so another agent vendoring the contract only has
+# to edit these two helpers, not the top-level imports.
+def _host_default_tracing_callback(
+    invoke_config: dict[str, Any],
+    *,
+    thread_id: str | None,
+    user_id: str | None,
+    trace_id: str | None,
+    model_name: str | None,
+) -> None:
+    """deer-flow default for DeerMem's ``tracing_callback`` slot.
+
+    Merges Langfuse trace metadata into ``invoke_config`` (no-op when
+    Langfuse is not an enabled tracing provider). Maps DeerMem's ``trace_id``
+    onto ``inject_langfuse_metadata``'s ``deerflow_trace_id`` kwarg -- the
+    name mismatch that previously made memory LLM tracing silently TypeError
+    is bridged here, at the host seam, so the portable package is untouched.
+    """
+    from deerflow.tracing import inject_langfuse_metadata
+
+    inject_langfuse_metadata(
+        invoke_config,
+        thread_id=thread_id,
+        user_id=user_id,
+        model_name=model_name,
+        deerflow_trace_id=trace_id,
+    )
+
+
+def _host_default_should_keep_hidden_message(additional_kwargs: Any) -> bool:
+    """deer-flow default for DeerMem's ``should_keep_hidden_message`` slot.
+
+    Keep a ``hide_from_ui`` message only when it carries a human-input
+    clarification response, so the user's clarification is captured into
+    memory; drop all other hidden messages (framework-internal reminders,
+    view-image payloads, etc.). Restores the pre-abstraction behaviour where
+    ``message_processing`` imported ``read_human_input_response`` directly.
+    """
+    from deerflow.agents.human_input import read_human_input_response
+
+    return read_human_input_response(additional_kwargs) is not None
+
+
 # ── Singleton factory ─────────────────────────────────────────────────────
 def get_memory_manager() -> MemoryManager:
     """Return the singleton :class:`MemoryManager` for the active config.
@@ -305,6 +360,15 @@ def get_memory_manager() -> MemoryManager:
         if not backend_config.get("storage_path"):
             from deerflow.config.runtime_paths import runtime_home
             backend_config["storage_path"] = str(runtime_home())
+        # Host-default hooks: callables cannot come from YAML, so the host
+        # injects them here. DeerMem consumes them (known config fields);
+        # mem0/noop ignore them (unknown-field filter in from_backend_config).
+        # An explicit value (incl. ``null`` in YAML) takes precedence -> the
+        # host default is only filled when the key is absent.
+        if "tracing_callback" not in backend_config:
+            backend_config["tracing_callback"] = _host_default_tracing_callback
+        if "should_keep_hidden_message" not in backend_config:
+            backend_config["should_keep_hidden_message"] = _host_default_should_keep_hidden_message
         _memory_manager = cls(backend_config=backend_config)
         logger.info("Memory manager resolved: %s (manager_class=%r)", cls.__name__, manager_class)
         return _memory_manager
