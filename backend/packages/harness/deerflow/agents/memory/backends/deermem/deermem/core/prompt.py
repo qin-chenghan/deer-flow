@@ -201,7 +201,7 @@ Rules:
 - The consolidated fact must preserve ALL key details from source facts
 - Only consolidate facts that describe the same aspect of the user
 - Confidence of consolidated fact = max of source confidences
-- Be conservative — when in doubt, keep facts separate
+- Be conservative - when in doubt, keep facts separate
 - Maximum {max_groups} consolidation groups per cycle"""
 
 
