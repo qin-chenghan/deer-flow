@@ -51,7 +51,7 @@ class MemoryManager(ABC):
     - :meth:`get_context` returns plain injection text; the *format* is the
       implementation's own choice and is NOT part of the contract (DeerMem
       does load + ``format_memory_for_injection``; another backend may do
-      ``mem0.search`` + its own formatting).
+      its own search + formatting).
     - :meth:`add` / :meth:`add_nowait` take raw conversation messages; any
       filtering / correction-/reinforcement-detection is the implementation's
       private concern (not on the contract).
@@ -278,7 +278,7 @@ def _resolve_manager_class(manager_class: str) -> type[MemoryManager]:
 # never names a deer-flow concept, so the host fills these slots HERE -- in the
 # factory, which is host code outside ``backends/deermem/``. Backends whose
 # config schema declares these slots (DeerMem) consume them via
-# ``from_backend_config``'s known-field filter; others (mem0 / noop) ignore
+# ``from_backend_config``'s known-field filter; others (e.g. noop) ignore
 # them. An explicit value in ``backend_config`` (set programmatically) takes
 # precedence and is left untouched.
 #
@@ -343,7 +343,7 @@ def get_memory_manager() -> MemoryManager:
     # the update queue fires on a Timer thread, and gateway/agent threads all
     # reach here. Double-checked locking ensures only one instance is built even
     # on first-call contention -- essential since backends now own stateful
-    # dependencies (DeerMem owns its storage/queue/updater; Mem0 would open
+    # dependencies (DeerMem owns its storage/queue/updater; others may open
     # connections) constructed here in __init__.
     with _manager_lock:
         if _memory_manager is not None:
@@ -362,7 +362,7 @@ def get_memory_manager() -> MemoryManager:
             backend_config["storage_path"] = str(runtime_home())
         # Host-default hooks: callables cannot come from YAML, so the host
         # injects them here. DeerMem consumes them (known config fields);
-        # mem0/noop ignore them (unknown-field filter in from_backend_config).
+        # noop ignores them (unknown-field filter in from_backend_config).
         # An explicit value (incl. ``null`` in YAML) takes precedence -> the
         # host default is only filled when the key is absent.
         if "tracing_callback" not in backend_config:

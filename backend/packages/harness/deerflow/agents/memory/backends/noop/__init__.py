@@ -1,6 +1,6 @@
 """Noop memory backend -- functional empty adapter (pluggability proof + template)."""
 
-from deerflow.agents.memory.backends.noop.noop_manager import NoopMemoryManager
+from .noop_manager import NoopMemoryManager
 
 #: The :class:`~deerflow.agents.memory.manager.MemoryManager` subclass this
 #: backend exposes. Discovered by the factory's ``_scan_backends`` drop-in
