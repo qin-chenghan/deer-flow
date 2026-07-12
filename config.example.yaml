@@ -1410,7 +1410,10 @@ summarization:
 #   staleness_protected_categories - Categories exempt from staleness review (default: ["correction"])
 memory:
   enabled: true
-  injection_enabled: true
+  injection_enabled: true # Whether to inject memory into system prompt
+  # Memory backend selector. Either a registered backend name (matching a
+  # backends/<name>/ folder that exposes MANAGER_CLASS, e.g. deermem / noop)
+  # or a dotted import path to a MemoryManager subclass.
   manager_class: deermem
   # Memory operation mode:
   #   middleware (default) - passive background extraction after each turn.
@@ -1421,22 +1424,39 @@ memory:
   # memory_search/add/update/delete go through the active backend; backends
   # without fact-CRUD return a JSON error instead of crashing.)
   mode: middleware
+  # Backend-private config (a dict), passed verbatim to the backend __init__.
+  # Each backend self-interprets it (DeerMem parses it into DeerMemConfig).
   backend_config:
-    storage_path: ""            # empty = deer-flow base_dir (factory injects absolute runtime_home)
-    debounce_seconds: 30
-    model:                      # LLM for memory extraction; omit all fields = no extraction
+    storage_path: ""            # empty = deer-flow base_dir (factory injects absolute runtime_home); absolute path opts out of per-user isolation
+    debounce_seconds: 30 # Wait time before processing queued updates
+    model:                      # LLM for memory extraction; omit all fields = no extraction (non-LLM ops still work; an update raises)
       # provider: openai
       # model: gpt-4o-mini
       # api_key: $OPENAI_API_KEY
       # base_url:               # optional, for OpenAI-compatible gateways (e.g. DeepSeek)
       # temperature:            # optional
-    max_facts: 100
-    fact_confidence_threshold: 0.7
-    max_injection_tokens: 2000
+    max_facts: 100 # Maximum number of facts to store
+    fact_confidence_threshold: 0.7 # Minimum confidence for storing facts
+    max_injection_tokens: 2000 # Maximum tokens for memory injection
+    # Token counting strategy for memory-injection budgeting:
+    #   tiktoken (default) - accurate, but the encoding BPE data may be
+    #     downloaded from a public network endpoint on first use. In
+    #     network-restricted environments this download can block for a long
+    #     time (see issues #3402 / #3429). Pre-cache the encoding or set this
+    #     to "char" to avoid it.
+    #   char - network-free CJK-aware character-based estimate; never touches
+    #     tiktoken. Slightly less precise budgeting, zero network I/O.
     token_counting: tiktoken
+    # Guaranteed injection: fact categories that bypass the regular token budget
+    # and draw from a reserved allowance, so high-signal corrections (e.g.
+    # "don use pip, use uv") survive even when the budget is tight.
     guaranteed_categories:
       - correction
     guaranteed_token_budget: 500
+    # Staleness review: periodically prune aged facts that may no longer reflect
+    # the user current situation. When triggered, the LLM reviews facts older
+    # than staleness_age_days during the normal memory-update call (same LLM
+    # invocation - no extra API call) and decides KEEP or REMOVE for each.
     staleness_review_enabled: true
     staleness_age_days: 90
     staleness_min_candidates: 3
@@ -1446,6 +1466,7 @@ memory:
     # Memory consolidation (opt-in, lossy: source facts are replaced by a
     # synthesized one; only consolidatedFrom IDs are kept). Runs in the same
     # memory-update LLM call as extraction/staleness - no extra API cost.
+    # consolidation_enabled defaults to false because consolidation is lossy.
     consolidation_enabled: false       # set true to opt into fact consolidation
     consolidation_min_facts: 8         # min facts in one category to trigger review (3-30)
     consolidation_max_groups_per_cycle: 3  # max groups merged per update cycle (1-10)
