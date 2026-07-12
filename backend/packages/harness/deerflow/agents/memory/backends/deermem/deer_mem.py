@@ -26,6 +26,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from deerflow.agents.memory.manager import MemoryManager
+
 from .deermem.config import DeerMemConfig
 from .deermem.core.llm import build_llm
 from .deermem.core.message_processing import (
@@ -37,7 +39,6 @@ from .deermem.core.prompt import format_memory_for_injection, warm_tiktoken_cach
 from .deermem.core.queue import MemoryUpdateQueue
 from .deermem.core.storage import create_storage
 from .deermem.core.updater import MemoryUpdater
-from deerflow.agents.memory.manager import MemoryManager
 
 logger = logging.getLogger(__name__)
 
@@ -182,11 +183,7 @@ class DeerMem(MemoryManager):
             return []
         query_lower = query.strip().lower()
         memory_data = self._updater.get_memory_data(agent_name=agent_name, user_id=user_id)
-        matched = [
-            fact
-            for fact in memory_data.get("facts", [])
-            if isinstance(fact.get("content"), str) and query_lower in fact["content"].lower()
-        ]
+        matched = [fact for fact in memory_data.get("facts", []) if isinstance(fact.get("content"), str) and query_lower in fact["content"].lower()]
         matched.sort(key=lambda f: f.get("confidence", 0), reverse=True)
         return matched[:top_k]
 

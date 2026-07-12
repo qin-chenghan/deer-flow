@@ -22,14 +22,14 @@ pytest.skip(
     allow_module_level=True,
 )
 
-from deerflow.agents.memory.backends.deermem.deermem.core.updater import (
+from deerflow.agents.memory.backends.deermem.deermem.core.updater import (  # noqa: E402
     MemoryUpdater,
     _build_staleness_section,
     _normalize_memory_update_data,
     _parse_fact_datetime,
     _select_stale_candidates,
 )
-from deerflow.config.memory_config import MemoryConfig
+from deerflow.config.memory_config import MemoryConfig  # noqa: E402
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 

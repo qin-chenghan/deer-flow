@@ -13,18 +13,17 @@ injected onto the updater so no network is needed.
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
+from deerflow.agents.memory.backends.deermem.deer_mem import DeerMem
 from deerflow.agents.memory.backends.deermem.deermem.core.message_processing import (
     filter_messages_for_memory,
 )
 from deerflow.agents.memory.backends.deermem.deermem.core.storage import FileMemoryStorage
-from deerflow.agents.memory.backends.deermem.deer_mem import DeerMem
 
 
 @pytest.fixture
@@ -67,8 +66,7 @@ def test_zero_config_defaults_run_non_llm_ops(deermem_data_dir):
     dm = DeerMem(backend_config=None)  # zero config
     assert dm._llm is None  # no model -> no LLM
     dm.import_memory(
-        {"version": "1.0", "lastUpdated": "", "user": {}, "history": {},
-         "facts": [{"id": "f", "content": "x", "category": "c", "confidence": 0.5, "createdAt": "", "source": "m"}]},
+        {"version": "1.0", "lastUpdated": "", "user": {}, "history": {}, "facts": [{"id": "f", "content": "x", "category": "c", "confidence": 0.5, "createdAt": "", "source": "m"}]},
         user_id="u",
     )
     assert "x" in dm.get_context(user_id="u")
@@ -81,25 +79,27 @@ def test_trace_id_threads_through_to_tracing_callback(deermem_data_dir):
     def tracer(cfg, *, thread_id, user_id, trace_id, model_name):
         calls.append((thread_id, trace_id, model_name))
 
-    dm = _deermem_with_fake_llm(
-        {"tracing_callback": tracer, "model": {"provider": "openai", "model": "gpt-x", "api_key": "k", "base_url": "u"}}
-    )
+    dm = _deermem_with_fake_llm({"tracing_callback": tracer, "model": {"provider": "openai", "model": "gpt-x", "api_key": "k", "base_url": "u"}})
     dm.add(
-        thread_id="t1", messages=[HumanMessage(content="hi"), AIMessage(content="hello")],
-        agent_name=None, user_id="u1", trace_id="trace-42",
+        thread_id="t1",
+        messages=[HumanMessage(content="hi"), AIMessage(content="hello")],
+        agent_name=None,
+        user_id="u1",
+        trace_id="trace-42",
     )
     dm._queue.flush()
     assert calls and calls[0] == ("t1", "trace-42", "gpt-x")
 
 
 def test_tracing_callback_optional_no_langfuse(deermem_data_dir):
-    dm = _deermem_with_fake_llm(
-        {"model": {"provider": "openai", "model": "gpt-x", "api_key": "k", "base_url": "u"}}
-    )
+    dm = _deermem_with_fake_llm({"model": {"provider": "openai", "model": "gpt-x", "api_key": "k", "base_url": "u"}})
     assert dm._config.tracing_callback is None  # langfuse not hard-required
     dm.add(
-        thread_id="t2", messages=[HumanMessage(content="hi"), AIMessage(content="hello")],
-        agent_name=None, user_id="u2", trace_id="t-99",
+        thread_id="t2",
+        messages=[HumanMessage(content="hi"), AIMessage(content="hello")],
+        agent_name=None,
+        user_id="u2",
+        trace_id="t-99",
     )
     dm._queue.flush()  # no callback, no error, update completes
 
@@ -203,8 +203,7 @@ def test_portability_vendor_to_other_agent(tmp_path, monkeypatch):
         assert hasattr(mod, "DeerMem")
         dm = mod.DeerMem(backend_config=None)  # zero config, self._llm=None
         dm.import_memory(
-            {"version": "1.0", "lastUpdated": "", "user": {}, "history": {},
-             "facts": [{"id": "f", "content": "y", "category": "c", "confidence": 0.5, "createdAt": "", "source": "m"}]},
+            {"version": "1.0", "lastUpdated": "", "user": {}, "history": {}, "facts": [{"id": "f", "content": "y", "category": "c", "confidence": 0.5, "createdAt": "", "source": "m"}]},
             user_id="ua",
         )
         assert "y" in dm.get_context(user_id="ua")

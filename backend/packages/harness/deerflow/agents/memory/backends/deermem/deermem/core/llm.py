@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def build_llm(model_config: "DeerMemModelConfig | None") -> Any:
+def build_llm(model_config: DeerMemModelConfig | None) -> Any:
     """Build a langchain ChatModel from DeerMem's model config (DI).
 
     Returns ``None`` if ``model_config`` is None or has no ``model`` set

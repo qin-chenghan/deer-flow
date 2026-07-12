@@ -8,12 +8,12 @@ pytest.skip(
     allow_module_level=True,
 )
 
-import asyncio
-import threading
-from unittest.mock import AsyncMock, MagicMock, patch
+import asyncio  # noqa: E402
+import threading  # noqa: E402
+from unittest.mock import AsyncMock, MagicMock, patch  # noqa: E402
 
-from deerflow.agents.memory.backends.deermem.deermem.core.prompt import format_conversation_for_update
-from deerflow.agents.memory.backends.deermem.deermem.core.updater import (
+from deerflow.agents.memory.backends.deermem.deermem.core.prompt import format_conversation_for_update  # noqa: E402
+from deerflow.agents.memory.backends.deermem.deermem.core.updater import (  # noqa: E402
     MemoryUpdater,
     _extract_text,
     clear_memory_data,
@@ -23,8 +23,8 @@ from deerflow.agents.memory.backends.deermem.deermem.core.updater import (
     import_memory_data,
     update_memory_fact,
 )
-from deerflow.config.memory_config import MemoryConfig
-from deerflow.trace_context import get_current_trace_id, request_trace_context
+from deerflow.config.memory_config import MemoryConfig  # noqa: E402
+from deerflow.trace_context import get_current_trace_id, request_trace_context  # noqa: E402
 
 
 def _make_memory(facts: list[dict[str, object]] | None = None) -> dict[str, object]:

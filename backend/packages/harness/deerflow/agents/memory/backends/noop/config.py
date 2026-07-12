@@ -37,8 +37,9 @@ every field -- but copy this structure, rename, and fill in your own knobs.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 
 @dataclass
@@ -68,7 +69,7 @@ class NoopConfig:
     should_keep_hidden_message: Callable[[Any], bool] | None = None
 
     @classmethod
-    def from_backend_config(cls, backend_config: dict[str, Any] | None) -> "NoopConfig":
+    def from_backend_config(cls, backend_config: dict[str, Any] | None) -> NoopConfig:
         """Build a config from the ``backend_config`` dict.
 
         Usage in your manager's ``__init__``::

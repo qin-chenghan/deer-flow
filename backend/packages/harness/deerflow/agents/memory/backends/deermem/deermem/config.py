@@ -43,12 +43,7 @@ class DeerMemConfig(BaseModel):
     # ── Storage ──────────────────────────────────────────────────────────
     storage_path: str = Field(
         default="",
-        description=(
-            "DeerMem data root. Empty = default (``$DEERMEM_DATA_DIR`` or "
-            "``~/.deermem/``); per-user memory at "
-            "``{root}/users/{user_id}/memory.json``. Any value (absolute or "
-            "relative) is used as the root directory."
-        ),
+        description=("DeerMem data root. Empty = default (``$DEERMEM_DATA_DIR`` or ``~/.deermem/``); per-user memory at ``{root}/users/{user_id}/memory.json``. Any value (absolute or relative) is used as the root directory."),
     )
     storage_class: str = Field(
         default="",
@@ -56,34 +51,38 @@ class DeerMemConfig(BaseModel):
     )
     # ── Queue ────────────────────────────────────────────────────────────
     debounce_seconds: int = Field(
-        default=30, ge=1, le=300,
+        default=30,
+        ge=1,
+        le=300,
         description="Seconds to wait before processing queued updates (debounce).",
     )
     # ── Facts ────────────────────────────────────────────────────────────
     max_facts: int = Field(default=100, ge=10, le=500, description="Maximum number of facts to store.")
     fact_confidence_threshold: float = Field(
-        default=0.7, ge=0.0, le=1.0,
+        default=0.7,
+        ge=0.0,
+        le=1.0,
         description="Minimum confidence threshold for storing facts.",
     )
     # ── Injection ────────────────────────────────────────────────────────
     max_injection_tokens: int = Field(
-        default=2000, ge=100, le=8000,
+        default=2000,
+        ge=100,
+        le=8000,
         description="Maximum tokens to use for memory injection.",
     )
     token_counting: Literal["tiktoken", "char"] = Field(
         default="tiktoken",
-        description=(
-            "Token counting strategy for memory-injection budgeting. 'tiktoken' "
-            "is accurate but may download BPE data on first use; 'char' is "
-            "network-free CJK-aware estimation."
-        ),
+        description=("Token counting strategy for memory-injection budgeting. 'tiktoken' is accurate but may download BPE data on first use; 'char' is network-free CJK-aware estimation."),
     )
     guaranteed_categories: list[str] = Field(
         default_factory=lambda: ["correction"],
         description="Fact categories always injected regardless of the regular token budget.",
     )
     guaranteed_token_budget: int = Field(
-        default=500, ge=50, le=2000,
+        default=500,
+        ge=50,
+        le=2000,
         description="Token ceiling for guaranteed-category facts.",
     )
     # ── Staleness review ─────────────────────────────────────────────────
@@ -92,15 +91,21 @@ class DeerMemConfig(BaseModel):
         description="Enable staleness review for aged facts.",
     )
     staleness_age_days: int = Field(
-        default=90, ge=30, le=365,
+        default=90,
+        ge=30,
+        le=365,
         description="Facts older than this become staleness-review candidates.",
     )
     staleness_min_candidates: int = Field(
-        default=3, ge=1, le=50,
+        default=3,
+        ge=1,
+        le=50,
         description="Minimum stale facts required to trigger a review cycle.",
     )
     staleness_max_removals_per_cycle: int = Field(
-        default=10, ge=1, le=50,
+        default=10,
+        ge=1,
+        le=50,
         description="Maximum facts the staleness review can remove per cycle.",
     )
     staleness_protected_categories: list[str] = Field(
@@ -121,15 +126,21 @@ class DeerMemConfig(BaseModel):
         ),
     )
     consolidation_min_facts: int = Field(
-        default=8, ge=3, le=30,
+        default=8,
+        ge=3,
+        le=30,
         description=("Minimum number of facts in a single category to trigger consolidation review. Below this threshold the overhead of surfacing the group is not justified."),
     )
     consolidation_max_groups_per_cycle: int = Field(
-        default=3, ge=1, le=10,
+        default=3,
+        ge=1,
+        le=10,
         description=("Maximum number of consolidation groups the LLM can merge in a single update cycle. Prevents over-consolidation."),
     )
     consolidation_max_sources: int = Field(
-        default=8, ge=2, le=20,
+        default=8,
+        ge=2,
+        le=20,
         description=("Maximum number of source facts per consolidation group. Prevents the LLM from merging too many facts into one and losing important details."),
     )
     # ── LLM (step 13: structured model sub-config consumed by core/llm.py build_llm) ──
@@ -150,15 +161,11 @@ class DeerMemConfig(BaseModel):
     )
     should_keep_hidden_message: Any = Field(
         default=None,
-        description=(
-            "Optional ``hook(additional_kwargs) -> bool``; when set, ``hide_from_ui`` "
-            "messages are kept if it returns True. None = skip all ``hide_from_ui`` "
-            "(host-agnostic safe default). Set programmatically."
-        ),
+        description=("Optional ``hook(additional_kwargs) -> bool``; when set, ``hide_from_ui`` messages are kept if it returns True. None = skip all ``hide_from_ui`` (host-agnostic safe default). Set programmatically."),
     )
 
     @classmethod
-    def from_backend_config(cls, backend_config: dict[str, Any] | None) -> "DeerMemConfig":
+    def from_backend_config(cls, backend_config: dict[str, Any] | None) -> DeerMemConfig:
         """Parse a ``backend_config`` dict; unknown keys ignored (forward-compat)."""
         if not backend_config:
             return cls()

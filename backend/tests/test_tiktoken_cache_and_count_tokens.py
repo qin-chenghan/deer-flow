@@ -20,7 +20,6 @@ from deerflow.agents.memory.backends.deermem.deermem.core.prompt import (
     format_memory_for_injection,
     warm_tiktoken_cache,
 )
-from deerflow.config.memory_config import MemoryConfig
 
 # ---------------------------------------------------------------------------
 # _get_tiktoken_encoding
@@ -333,15 +332,18 @@ class TestDeerMemConfigTokenCounting:
 
     def test_default_is_tiktoken(self):
         from deerflow.agents.memory.backends.deermem.deermem.config import DeerMemConfig
+
         assert DeerMemConfig().token_counting == "tiktoken"
 
     def test_accepts_char(self):
         from deerflow.agents.memory.backends.deermem.deermem.config import DeerMemConfig
+
         assert DeerMemConfig(token_counting="char").token_counting == "char"
 
     def test_rejects_invalid_value(self):
         import pytest
         from pydantic import ValidationError
+
         from deerflow.agents.memory.backends.deermem.deermem.config import DeerMemConfig
 
         with pytest.raises(ValidationError):

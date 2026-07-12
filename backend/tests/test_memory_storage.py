@@ -1,7 +1,7 @@
 """Tests for memory storage providers (DI: FileMemoryStorage(config) / create_storage)."""
 
 import threading
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -166,7 +166,5 @@ class TestCreateStorage:
         assert isinstance(storage, FileMemoryStorage)
 
     def test_dotted_storage_class_resolves(self):
-        storage = create_storage(
-            DeerMemConfig(storage_class="deerflow.agents.memory.backends.deermem.deermem.core.storage.FileMemoryStorage")
-        )
+        storage = create_storage(DeerMemConfig(storage_class="deerflow.agents.memory.backends.deermem.deermem.core.storage.FileMemoryStorage"))
         assert isinstance(storage, FileMemoryStorage)

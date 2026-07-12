@@ -67,7 +67,7 @@ def _default_root() -> Path:
 
 
 def memory_file_path(
-    config: "DeerMemConfig",
+    config: DeerMemConfig,
     agent_name: str | None = None,
     *,
     user_id: str | None = None,
