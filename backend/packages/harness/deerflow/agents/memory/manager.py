@@ -277,11 +277,9 @@ def _resolve_manager_class(manager_class: str) -> type[MemoryManager]:
 
     raise ValueError(
         f"memory.manager_class={manager_class!r} is not a registered backend name "
-        f"(known: {sorted(registry)}) nor a resolvable 'pkg.mod:Cls' path"
-        + (f": {dotted_error}" if dotted_error else "")
-        + ". Fix memory.manager_class in config; refusing to silently fall back to a "
-        f"different storage backend (memory is persistent state -- a wrong store is a "
-        f"silent data-integrity footgun)."
+        f"(known: {sorted(registry)}) nor a resolvable 'pkg.mod:Cls' path" + (f": {dotted_error}" if dotted_error else "") + ". Fix memory.manager_class in config; refusing to silently fall back to a "
+        "different storage backend (memory is persistent state -- a wrong store is a "
+        "silent data-integrity footgun)."
     )
 
 
@@ -354,6 +352,7 @@ def _host_default_llm() -> Any:
     """
     try:
         from deerflow.models import create_chat_model
+
         return create_chat_model(name=None)
     except Exception:  # noqa: BLE001 - no default model is a config state, not a crash
         logger.warning("Could not build host default model for DeerMem memory extraction; memory extraction will be disabled", exc_info=True)
@@ -393,6 +392,7 @@ def get_memory_manager() -> MemoryManager:
         # same as pre-abstraction) unless the host explicitly sets storage_path.
         if not backend_config.get("storage_path"):
             from deerflow.config.runtime_paths import runtime_home
+
             backend_config["storage_path"] = str(runtime_home())
         # Host-default hooks: callables cannot come from YAML, so the host
         # injects them here. DeerMem consumes them (known config fields);
@@ -415,6 +415,7 @@ def get_memory_manager() -> MemoryManager:
         # ContextVar. A None trace_id is left unbound by the updater's guard.
         if "trace_context_manager" not in backend_config:
             from deerflow.trace_context import request_trace_context
+
             backend_config["trace_context_manager"] = request_trace_context
         _memory_manager = cls(backend_config=backend_config)
         logger.info("Memory manager resolved: %s (manager_class=%r)", cls.__name__, manager_class)

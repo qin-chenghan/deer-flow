@@ -146,7 +146,13 @@ class DeerMemConfig(BaseModel):
     # ── LLM (step 13: structured model sub-config consumed by core/llm.py build_llm) ──
     model: DeerMemModelConfig = Field(
         default_factory=DeerMemModelConfig,
-        description=("Memory-update LLM config (provider/model/api_key/base_url/temperature). Empty = the host factory injects its default chat model as ``host_llm`` (zero-config UX, mirrors pre-abstraction ``model_name: null``); when ``host_llm`` is also absent (standalone DeerMem) an update raises but non-LLM ops still work."),
+        description=(
+            "Memory-update LLM config (provider/model/api_key/base_url/temperature). "
+            "Empty = the host factory injects its default chat model as ``host_llm`` "
+            "(zero-config UX, mirrors pre-abstraction ``model_name: null``); "
+            "when ``host_llm`` is also absent (standalone DeerMem) an update raises "
+            "but non-LLM ops still work."
+        ),
     )
     # ── Hooks (steps 14-15: optional host-injected callables; None = DeerMem defaults) ──
     tracing_callback: Any = Field(
