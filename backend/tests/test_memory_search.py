@@ -91,6 +91,35 @@ class TestDeerMemSearch:
         results = mgr.search("Fact", top_k=5)
         assert len(results) == 5
 
+    def test_null_confidence_does_not_crash_sort(self):
+        """A fact stored with ``"confidence": null`` (corrupted/hand-edited memory)
+        must not break the confidence sort. ``.get("confidence", 0)`` returns the
+        stored ``None`` and comparing None with floats raises TypeError; the coerce
+        helper defaults null to a finite midpoint instead."""
+        null_fact = {
+            "id": "fact_null",
+            "content": "Fact with null confidence",
+            "category": "context",
+            "confidence": None,
+            "createdAt": "2026-07-09T00:00:00Z",
+            "source": "test",
+        }
+        facts = [
+            _make_fact("Fact high", confidence=0.9),
+            null_fact,
+            _make_fact("Fact low", confidence=0.2),
+        ]
+        mgr = _deer_mem_with_facts(facts)
+
+        # Must not raise TypeError during the confidence sort.
+        results = mgr.search("Fact")
+
+        assert len(results) == 3
+        # Highest real confidence still sorts first; null (coerced to 0.5) sits
+        # between the 0.9 and 0.2 facts.
+        assert results[0]["content"] == "Fact high"
+        assert {r["content"] for r in results} == {"Fact high", "Fact with null confidence", "Fact low"}
+
     def test_non_positive_top_k_returns_empty(self):
         """Should return empty for top_k <= 0 (no negative-slice expansion)."""
         mgr = _deer_mem_with_facts([_make_fact(f"Fact {i}", confidence=0.5) for i in range(3)])
