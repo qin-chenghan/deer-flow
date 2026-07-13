@@ -26,15 +26,18 @@ def test_process_queue_forwards_correction_flag_to_updater() -> None:
     mock_updater = MagicMock()
     mock_updater.update_memory.return_value = True
     queue = _queue(mock_updater)
-    queue._queue = [
-        ConversationContext(thread_id="thread-1", messages=["conversation"], agent_name="lead_agent", correction_detected=True)
-    ]
+    queue._queue = [ConversationContext(thread_id="thread-1", messages=["conversation"], agent_name="lead_agent", correction_detected=True)]
 
     queue._process_queue()
 
     mock_updater.update_memory.assert_called_once_with(
-        messages=["conversation"], thread_id="thread-1", agent_name="lead_agent",
-        correction_detected=True, reinforcement_detected=False, user_id=None, trace_id=None,
+        messages=["conversation"],
+        thread_id="thread-1",
+        agent_name="lead_agent",
+        correction_detected=True,
+        reinforcement_detected=False,
+        user_id=None,
+        trace_id=None,
     )
 
 
@@ -53,15 +56,18 @@ def test_process_queue_forwards_reinforcement_flag_to_updater() -> None:
     mock_updater = MagicMock()
     mock_updater.update_memory.return_value = True
     queue = _queue(mock_updater)
-    queue._queue = [
-        ConversationContext(thread_id="thread-1", messages=["conversation"], agent_name="lead_agent", reinforcement_detected=True)
-    ]
+    queue._queue = [ConversationContext(thread_id="thread-1", messages=["conversation"], agent_name="lead_agent", reinforcement_detected=True)]
 
     queue._process_queue()
 
     mock_updater.update_memory.assert_called_once_with(
-        messages=["conversation"], thread_id="thread-1", agent_name="lead_agent",
-        correction_detected=False, reinforcement_detected=True, user_id=None, trace_id=None,
+        messages=["conversation"],
+        thread_id="thread-1",
+        agent_name="lead_agent",
+        correction_detected=False,
+        reinforcement_detected=True,
+        user_id=None,
+        trace_id=None,
     )
 
 
@@ -218,10 +224,8 @@ def test_process_queue_updates_different_agents_in_same_thread_separately() -> N
     assert mock_updater.update_memory.call_count == 2
     mock_updater.update_memory.assert_has_calls(
         [
-            call(messages=["agent-a"], thread_id="thread-1", agent_name="agent-a",
-                 correction_detected=False, reinforcement_detected=False, user_id=None, trace_id=None),
-            call(messages=["agent-b"], thread_id="thread-1", agent_name="agent-b",
-                 correction_detected=False, reinforcement_detected=False, user_id=None, trace_id=None),
+            call(messages=["agent-a"], thread_id="thread-1", agent_name="agent-a", correction_detected=False, reinforcement_detected=False, user_id=None, trace_id=None),
+            call(messages=["agent-b"], thread_id="thread-1", agent_name="agent-b", correction_detected=False, reinforcement_detected=False, user_id=None, trace_id=None),
         ]
     )
 
@@ -230,13 +234,16 @@ def test_process_queue_forwards_trace_id_to_updater() -> None:
     mock_updater = MagicMock()
     mock_updater.update_memory.return_value = True
     queue = _queue(mock_updater)
-    queue._queue = [
-        ConversationContext(thread_id="thread-1", messages=["conversation"], agent_name="lead_agent", trace_id="trace-memory-1")
-    ]
+    queue._queue = [ConversationContext(thread_id="thread-1", messages=["conversation"], agent_name="lead_agent", trace_id="trace-memory-1")]
 
     queue._process_queue()
 
     mock_updater.update_memory.assert_called_once_with(
-        messages=["conversation"], thread_id="thread-1", agent_name="lead_agent",
-        correction_detected=False, reinforcement_detected=False, user_id=None, trace_id="trace-memory-1",
+        messages=["conversation"],
+        thread_id="thread-1",
+        agent_name="lead_agent",
+        correction_detected=False,
+        reinforcement_detected=False,
+        user_id=None,
+        trace_id="trace-memory-1",
     )

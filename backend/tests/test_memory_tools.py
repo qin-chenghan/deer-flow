@@ -228,6 +228,7 @@ class TestMemoryAddTool:
         # resolve_runtime_user_id is monkeypatched to "test-user" by _install_manager;
         # override here to assert the runtime channel flows through.
         import deerflow.agents.memory.tools as tools_mod
+
         tools_mod.resolve_runtime_user_id = lambda r: "runtime-user"
 
         result_json = memory_add_tool.func(runtime, "User prefers dark mode")
@@ -247,10 +248,7 @@ class TestMemoryAddTool:
 
     def test_rejects_duplicate_content_outside_top_k(self, monkeypatch):
         """Dup check reads the full memory (get_memory), not a capped search."""
-        facts = [
-            {"id": f"fact_{i}", "content": f"variant {i}", "category": "preference", "confidence": 0.9}
-            for i in range(12)
-        ]
+        facts = [{"id": f"fact_{i}", "content": f"variant {i}", "category": "preference", "confidence": 0.9} for i in range(12)]
         facts.append({"id": "fact_exact", "content": "User prefers dark mode", "category": "preference", "confidence": 0.1})
         mgr = _install_manager(monkeypatch, _MockManager(facts=facts))
 

@@ -135,11 +135,7 @@ def memory_add_tool(
             user_id=user_id,
         )
         fact_id = next(
-            (
-                fact.get("id")
-                for fact in updated_memory.get("facts", [])
-                if _memory_content_key(str(fact.get("content", ""))) == content_key
-            ),
+            (fact.get("id") for fact in updated_memory.get("facts", []) if _memory_content_key(str(fact.get("content", ""))) == content_key),
             None,
         )
         if fact_id is None:

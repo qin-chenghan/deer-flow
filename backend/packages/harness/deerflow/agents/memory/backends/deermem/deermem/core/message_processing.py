@@ -81,11 +81,7 @@ def _is_human_clarification_response(additional_kwargs: Any) -> bool:
         return False
     if raw.get("version") != 1 or raw.get("kind") != "human_input_response":
         return False
-    if (
-        _non_empty_str(raw.get("source")) is None
-        or _non_empty_str(raw.get("request_id")) is None
-        or _non_empty_str(raw.get("value")) is None
-    ):
+    if _non_empty_str(raw.get("source")) is None or _non_empty_str(raw.get("request_id")) is None or _non_empty_str(raw.get("value")) is None:
         return False
     response_kind = raw.get("response_kind")
     if response_kind == "text":

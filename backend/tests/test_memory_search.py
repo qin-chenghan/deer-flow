@@ -25,9 +25,7 @@ def _make_fact(content: str, category: str = "context", confidence: float = 0.7)
 def _deer_mem_with_facts(facts: list[dict]) -> DeerMem:
     """Build a DeerMem whose updater returns the given facts (no disk I/O)."""
     mgr = DeerMem(backend_config=None)
-    mgr._updater = SimpleNamespace(
-        get_memory_data=lambda agent_name=None, *, user_id=None: {"facts": facts}
-    )
+    mgr._updater = SimpleNamespace(get_memory_data=lambda agent_name=None, *, user_id=None: {"facts": facts})
     return mgr
 
 

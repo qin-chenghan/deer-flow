@@ -189,13 +189,7 @@ class DeerMem(MemoryManager):
             return []
         query_lower = query.strip().lower()
         memory_data = self._updater.get_memory_data(agent_name=agent_name, user_id=user_id)
-        matched = [
-            fact
-            for fact in memory_data.get("facts", [])
-            if isinstance(fact.get("content"), str)
-            and query_lower in fact["content"].lower()
-            and (category is None or fact.get("category") == category)
-        ]
+        matched = [fact for fact in memory_data.get("facts", []) if isinstance(fact.get("content"), str) and query_lower in fact["content"].lower() and (category is None or fact.get("category") == category)]
         matched.sort(key=_coerce_source_confidence, reverse=True)
         return matched[:top_k]
 

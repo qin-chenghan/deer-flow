@@ -782,10 +782,7 @@ class MemoryUpdater:
             model_name = self._config.model.model
             model = self._llm
             if model is None:
-                raise RuntimeError(
-                    "DeerMem memory update requested but no LLM is configured "
-                    "(set memory.backend_config.model in config)."
-                )
+                raise RuntimeError("DeerMem memory update requested but no LLM is configured (set memory.backend_config.model in config).")
             invoke_config: dict[str, Any] = {"run_name": "memory_agent"}
             # Optional observability callback (e.g. langfuse), injected via
             # backend_config.tracing_callback. None = no tracing (langfuse is not
