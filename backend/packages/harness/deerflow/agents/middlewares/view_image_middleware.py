@@ -1,6 +1,8 @@
 """Middleware for injecting image details into conversation before LLM call."""
 
+import base64
 import logging
+from pathlib import Path
 from typing import override
 
 from langchain.agents.middleware import AgentMiddleware
@@ -94,6 +96,12 @@ class ViewImageMiddleware(AgentMiddleware[ViewImageMiddlewareState]):
     def _create_image_details_message(self, state: ViewImageMiddlewareState) -> list[str | dict]:
         """Create a formatted message with all viewed image details.
 
+        Reads image files from disk on-demand and encodes them as base64
+        for the model. The base64 data is NOT persisted in state -- only
+        lightweight metadata (path, mime_type, size) is stored in
+        ``viewed_images``, avoiding large duplicate payloads across every
+        checkpoint (see #4138).
+
         Args:
             state: Current state containing viewed_images
 
@@ -110,19 +118,29 @@ class ViewImageMiddleware(AgentMiddleware[ViewImageMiddlewareState]):
 
         for image_path, image_data in viewed_images.items():
             mime_type = image_data.get("mime_type", "unknown")
-            base64_data = image_data.get("base64", "")
+            actual_path = image_data.get("actual_path", "")
 
             # Add text description
             content_blocks.append({"type": "text", "text": f"\n- **{image_path}** ({mime_type})"})
 
-            # Add the actual image data so LLM can "see" it
-            if base64_data:
-                content_blocks.append(
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:{mime_type};base64,{base64_data}"},
-                    }
-                )
+            # Read the image file on-demand and encode as base64 for the model
+            if actual_path:
+                try:
+                    file_path = Path(actual_path)
+                    if file_path.exists() and file_path.is_file():
+                        with open(file_path, "rb") as f:
+                            image_bytes = f.read()
+                        base64_data = base64.b64encode(image_bytes).decode("utf-8")
+                        content_blocks.append(
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:{mime_type};base64,{base64_data}"},
+                            }
+                        )
+                    else:
+                        content_blocks.append({"type": "text", "text": f"  (file no longer available: {actual_path})"})
+                except OSError as e:
+                    content_blocks.append({"type": "text", "text": f"  (error reading file: {e})"})
 
         return content_blocks
 
