@@ -1617,6 +1617,7 @@ class TestMemoryManagement:
     def test_get_memory_config(self, client):
         config = MagicMock()
         config.enabled = True
+        config.mode = "middleware"
         config.injection_enabled = True
         config.manager_class = "deermem"
         config.backend_config = {}
@@ -1630,6 +1631,7 @@ class TestMemoryManagement:
     def test_get_memory_status(self, client):
         config = MagicMock()
         config.enabled = True
+        config.mode = "middleware"
         config.injection_enabled = True
         config.manager_class = "deermem"
         config.backend_config = {}
@@ -2307,6 +2309,7 @@ class TestScenarioMemoryWorkflow:
 
         config = MagicMock()
         config.enabled = True
+        config.mode = "middleware"
         config.injection_enabled = True
         config.manager_class = "deermem"
         config.backend_config = {}
@@ -2689,6 +2692,7 @@ class TestGatewayConformance:
     def test_get_memory_config(self, client):
         mem_cfg = MagicMock()
         mem_cfg.enabled = True
+        mem_cfg.mode = "middleware"
         mem_cfg.injection_enabled = True
         mem_cfg.manager_class = "deermem"
         mem_cfg.backend_config = {}
@@ -2703,6 +2707,7 @@ class TestGatewayConformance:
     def test_get_memory_status(self, client):
         mem_cfg = MagicMock()
         mem_cfg.enabled = True
+        mem_cfg.mode = "middleware"
         mem_cfg.injection_enabled = True
         mem_cfg.manager_class = "deermem"
         mem_cfg.backend_config = {}

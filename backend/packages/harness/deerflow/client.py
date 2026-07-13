@@ -1332,6 +1332,7 @@ class DeerFlowClient:
         config = get_memory_config()
         return {
             "enabled": config.enabled,
+            "mode": config.mode,
             "injection_enabled": config.injection_enabled,
             "manager_class": config.manager_class,
             "backend_config": config.backend_config,

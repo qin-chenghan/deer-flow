@@ -1,5 +1,7 @@
 """Memory API router for retrieving and managing global memory data."""
 
+from typing import Literal
+
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
@@ -126,6 +128,7 @@ class MemoryConfigResponse(BaseModel):
     """Response model for memory configuration."""
 
     enabled: bool = Field(..., description="Whether the memory mechanism is enabled (call-site gate).")
+    mode: Literal["middleware", "tool"] = Field(..., description="Memory operation mode: 'middleware' (passive per-turn LLM summarization) or 'tool' (model calls memory tools directly). Mechanism-level, applies to any backend.")
     injection_enabled: bool = Field(..., description="Whether memory is injected into the system prompt (call-site gate).")
     manager_class: str = Field(..., description="Active memory backend selector (backend name or dotted path).")
     backend_config: dict = Field(..., description="Backend-private config (self-interpreted by the backend).")
@@ -340,8 +343,9 @@ async def get_memory_config_endpoint() -> MemoryConfigResponse:
 
     Returns:
         The current memory configuration. The response is backend-agnostic:
-        ``enabled`` / ``injection_enabled`` are mechanism-level gates that apply
-        to any backend, and ``backend_config`` is an opaque dict the active
+        ``enabled`` / ``injection_enabled`` / ``mode`` are mechanism-level
+        fields that apply to any backend (``mode`` selects middleware vs tool
+        operation), and ``backend_config`` is an opaque dict the active
         backend (``manager_class``) self-interprets. DeerMem's knobs
         (``storage_path``, ``max_facts``, ``debounce_seconds``, ...) live under
         ``backend_config`` -- they are NOT top-level, because a non-DeerMem
@@ -352,6 +356,7 @@ async def get_memory_config_endpoint() -> MemoryConfigResponse:
         {
             "enabled": true,
             "injection_enabled": true,
+            "mode": "middleware",
             "manager_class": "deermem",
             "backend_config": {
                 "storage_path": "/.../.deer-flow",
@@ -367,6 +372,7 @@ async def get_memory_config_endpoint() -> MemoryConfigResponse:
     config = get_memory_config()
     return MemoryConfigResponse(
         enabled=config.enabled,
+        mode=config.mode,
         injection_enabled=config.injection_enabled,
         manager_class=config.manager_class,
         backend_config=config.backend_config,
@@ -392,6 +398,7 @@ async def get_memory_status(http_request: Request) -> MemoryStatusResponse:
     return MemoryStatusResponse(
         config=MemoryConfigResponse(
             enabled=config.enabled,
+            mode=config.mode,
             injection_enabled=config.injection_enabled,
             manager_class=config.manager_class,
             backend_config=config.backend_config,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from copy import copy
 from typing import Any
 
@@ -53,12 +54,57 @@ def extract_message_text(message: Any) -> str:
     return str(content)
 
 
+def _non_empty_str(value: object) -> str | None:
+    """Return ``value`` if it is a non-empty (stripped) string, else None."""
+    return value if isinstance(value, str) and value.strip() else None
+
+
+def _is_human_clarification_response(additional_kwargs: Any) -> bool:
+    """Return True iff ``additional_kwargs`` carries a well-formed human
+    clarification response (a user-authored answer worth remembering).
+
+    Host-agnostic structural mirror of deer-flow's ``read_human_input_response``
+    (which the host injects via ``should_keep_hidden_message`` in production):
+    a ``human_input_response`` mapping with version 1 + kind
+    ``human_input_response``, non-empty source/request_id/value, and (for
+    option responses) a non-empty option_id. Malformed/partial payloads return
+    False so they are excluded like other hide_from_ui framework messages.
+    Kept inline (no host import) so the bare ``filter_messages_for_memory``
+    does the right thing standalone and in tests. NOTE: if the
+    human_input_response format changes, keep this in sync with
+    ``read_human_input_response`` (the production path) -- they must agree.
+    """
+    if not isinstance(additional_kwargs, Mapping):
+        return False
+    raw = additional_kwargs.get("human_input_response")
+    if not isinstance(raw, Mapping):
+        return False
+    if raw.get("version") != 1 or raw.get("kind") != "human_input_response":
+        return False
+    if (
+        _non_empty_str(raw.get("source")) is None
+        or _non_empty_str(raw.get("request_id")) is None
+        or _non_empty_str(raw.get("value")) is None
+    ):
+        return False
+    response_kind = raw.get("response_kind")
+    if response_kind == "text":
+        return True
+    if response_kind == "option":
+        return _non_empty_str(raw.get("option_id")) is not None
+    return False
+
+
 def filter_messages_for_memory(messages: list[Any], *, should_keep_hidden_message: Any = None) -> list[Any]:
     """Keep only user inputs and final assistant responses for memory updates.
 
-    ``hide_from_ui`` messages are skipped by default (host-agnostic safe
-    default); pass a ``should_keep_hidden_message(additional_kwargs) -> bool``
-    hook to keep specific hidden messages (e.g. human-clarification responses).
+    ``hide_from_ui`` framework messages are skipped, but user-authored
+    clarification answers (a well-formed ``human_input_response``) are kept by
+    default via a host-agnostic structural check (mirrors deer-flow's
+    ``read_human_input_response``). Pass a ``should_keep_hidden_message(
+    additional_kwargs) -> bool`` hook to override the keep decision; the host
+    injects one delegating to the authoritative ``read_human_input_response``
+    in production.
     """
     filtered = []
     skip_next_ai = False
@@ -72,11 +118,21 @@ def filter_messages_for_memory(messages: list[Any], *, should_keep_hidden_messag
             # framework-internal text pollutes long-term memory (and the p0 __memory
             # payload could trigger a self-amplification loop).
             additional_kwargs = getattr(msg, "additional_kwargs", {}) or {}
-            if additional_kwargs.get("hide_from_ui") and (
-                should_keep_hidden_message is None
-                or not should_keep_hidden_message(additional_kwargs)
-            ):
-                continue
+            if additional_kwargs.get("hide_from_ui"):
+                # Framework-injected hidden messages (TodoMiddleware reminders,
+                # ViewImage payloads, p0 __memory self-amplification guard) are
+                # excluded. User-authored clarification answers (a well-formed
+                # human_input_response) ARE real content worth remembering, so
+                # they are kept by default via a host-agnostic structural check.
+                # A host ``should_keep_hidden_message`` hook, when supplied,
+                # overrides this (production DeerMem injects one delegating to
+                # the authoritative read_human_input_response).
+                if should_keep_hidden_message is not None:
+                    keep = should_keep_hidden_message(additional_kwargs)
+                else:
+                    keep = _is_human_clarification_response(additional_kwargs)
+                if not keep:
+                    continue
             content_str = extract_message_text(msg)
             if "<uploaded_files>" in content_str:
                 stripped = _UPLOAD_BLOCK_RE.sub("", content_str).strip()

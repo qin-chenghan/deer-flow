@@ -38,7 +38,10 @@ class MemoryConfig(BaseModel):
             "(matching a `backends/<name>/` folder that exposes `MANAGER_CLASS`, "
             "e.g. `deermem` / `noop`) or a dotted import path to a "
             "`MemoryManager` subclass. The factory resolves this at "
-            "`get_memory_manager()` time and falls back to DeerMem on failure."
+            "`get_memory_manager()` time and raises `ValueError` on failure "
+            "(fail-fast: memory is persistent state, so an unresolved "
+            "manager_class is not silently substituted with a different "
+            "storage backend)."
         ),
     )
     backend_config: dict[str, Any] = Field(

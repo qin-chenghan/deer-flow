@@ -797,6 +797,7 @@ class TestMemoryAccess:
         assert "injection_enabled" in result
         assert "manager_class" in result
         assert "backend_config" in result
+        assert "mode" in result
 
     def test_get_memory_status_combines_config_and_data(self, e2e_env):
         """get_memory_status() returns both 'config' and 'data' keys."""
@@ -805,4 +806,5 @@ class TestMemoryAccess:
         assert "config" in result
         assert "data" in result
         assert "enabled" in result["config"]
+        assert "mode" in result["config"]
         assert isinstance(result["data"], dict)
