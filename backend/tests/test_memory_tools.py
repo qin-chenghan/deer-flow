@@ -53,11 +53,16 @@ class _MockManager:
         self._supports_delete = supports_delete
         self.calls = []
 
-    def search(self, query, top_k=5, *, user_id=None, agent_name=None):
-        self.calls.append(("search", query, top_k, user_id, agent_name))
+    def search(self, query, top_k=5, *, user_id=None, agent_name=None, category=None):
+        self.calls.append(("search", query, top_k, user_id, agent_name, category))
         if self._raise_on_search:
             raise self._raise_on_search
-        return list(self._search_results)
+        # Mirror the real backend: filter by category BEFORE returning, so the
+        # tool's category kwarg is honoured server-side (not client-side).
+        results = list(self._search_results)
+        if category is not None:
+            results = [f for f in results if f.get("category") == category]
+        return results
 
     def get_memory(self, *, user_id=None, agent_name=None):
         self.calls.append(("get_memory", user_id, agent_name))
@@ -152,18 +157,21 @@ class TestMemorySearchTool:
         assert result["count"] == 0
         assert result["results"] == []
 
-    def test_category_filter_applied_client_side(self, monkeypatch):
-        """Category filter narrows the manager's results."""
+    def test_category_filter_forwarded_to_backend(self, monkeypatch):
+        """Category kwarg is forwarded to the backend, which filters before slicing."""
         results = [
             {"id": "f1", "content": "likes uv", "category": "preference", "confidence": 0.9},
             {"id": "f2", "content": "uses uv", "category": "context", "confidence": 0.5},
         ]
-        _install_manager(monkeypatch, _MockManager(search_results=results))
+        mgr = _install_manager(monkeypatch, _MockManager(search_results=results))
 
         result_json = memory_search_tool.func(SimpleNamespace(context={}), "uv", category="preference", limit=10)
         result = json.loads(result_json)
         assert result["count"] == 1
         assert result["results"][0]["id"] == "f1"
+        # category is forwarded to the backend search call (not filtered client-side)
+        assert mgr.calls[0][0] == "search"
+        assert mgr.calls[0][5] == "preference"  # category kwarg
 
     def test_runtime_error_returns_error_json(self, monkeypatch):
         """Should return error JSON when search raises."""

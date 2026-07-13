@@ -7,7 +7,7 @@ import tempfile
 import zipfile
 from enum import Enum
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage, ToolMessage  # noqa: F401
@@ -1563,6 +1563,7 @@ class TestMemoryManagement:
                 content="User prefers concise code reviews.",
                 category="preference",
                 confidence=0.88,
+                user_id=ANY,
             )
         assert result == data
 
@@ -1572,7 +1573,7 @@ class TestMemoryManagement:
         mock_mgr.delete_fact.return_value = data
         with patch("deerflow.agents.memory.get_memory_manager", return_value=mock_mgr):
             result = client.delete_memory_fact("fact_123")
-            mock_mgr.delete_fact.assert_called_once_with("fact_123")
+            mock_mgr.delete_fact.assert_called_once_with("fact_123", user_id=ANY)
         assert result == data
 
     def test_update_memory_fact(self, client):
@@ -1591,6 +1592,7 @@ class TestMemoryManagement:
                 content="User prefers spaces",
                 category="workflow",
                 confidence=0.91,
+                user_id=ANY,
             )
         assert result == data
 
@@ -1608,6 +1610,7 @@ class TestMemoryManagement:
                 content="User prefers spaces",
                 category=None,
                 confidence=None,
+                user_id=ANY,
             )
         assert result == data
 

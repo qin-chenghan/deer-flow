@@ -5,10 +5,14 @@ model sub-config (provider/model/api_key/base_url/temperature) via
 ``langchain.chat_models.init_chat_model``. DeerMem owns the resulting instance
 (``self._llm``) and injects it into ``MemoryUpdater`` (dependency injection).
 
-Returns ``None`` when no model is configured (zero-config): DeerMem still
-serves non-LLM ops (get/clear/import/get_context); an actual memory update
-raises a clear error. Any provider langchain's ``init_chat_model`` supports
-works (OpenAI, Anthropic, OpenAI-compatible gateways like DeepSeek, ...).
+``DeerMem.__init__`` prefers a host-injected ``host_llm`` (the deer-flow
+factory injects the app default model there when ``model`` is empty, mirroring
+pre-abstraction ``model_name: null``); this ``build_llm`` is the fallback that
+builds from the ``model`` sub-config. Returns ``None`` when ``model`` is empty
+- standalone DeerMem then has no LLM (non-LLM ops still work; an update
+raises), but via the factory ``host_llm`` covers the zero-config case. Any
+provider langchain's ``init_chat_model`` supports works (OpenAI, Anthropic,
+OpenAI-compatible gateways like DeepSeek, ...).
 """
 
 from __future__ import annotations

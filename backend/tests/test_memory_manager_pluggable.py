@@ -3,7 +3,7 @@
 Covers the drop-in contract end-to-end:
 - short name -> registered backend (deermem / noop);
 - dotted path (``module.Attr`` and ``module:Attr``) -> the same class;
-- unknown value -> DeerMem fallback.
+- unknown value -> raise (fail-fast: a wrong store is a silent data-integrity footgun).
 
 Also pins the noop empty-memory behaviour and the ``hasattr`` capability
 probing surface (reload_memory + fact CRUD) that the gateway/client rely on.
@@ -55,10 +55,13 @@ def test_resolves_configured_backend(manager_class: str, expected: type[MemoryMa
     assert get_memory_manager() is manager
 
 
-def test_unknown_backend_falls_back_to_deermem() -> None:
+def test_unknown_backend_raises_instead_of_falling_back() -> None:
+    """An unknown manager_class is a config error: raise, don't silently fall
+    back to DeerMem (memory is persistent state -- a wrong store is a silent
+    data-integrity footgun)."""
     set_memory_config(MemoryConfig(manager_class="bogus-backend"))
-    manager = get_memory_manager()
-    assert isinstance(manager, DeerMem)
+    with pytest.raises(ValueError, match="bogus-backend"):
+        get_memory_manager()
 
 
 def test_noop_runs_with_empty_memory() -> None:

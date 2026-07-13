@@ -107,7 +107,7 @@ def _extract_text(content: Any) -> str:
     return str(content)
 
 
-_REQUIRED_MEMORY_UPDATE_TOP_LEVEL_KEYS = frozenset({"user", "history", "newFacts", "factsToRemove"})
+_REQUIRED_MEMORY_UPDATE_TOP_LEVEL_KEYS = frozenset({"user", "history", "newFacts"})
 
 
 def _normalize_memory_update_fact(fact: Any) -> dict[str, Any] | None:
@@ -375,11 +375,11 @@ def _build_staleness_section(
     lines: list[str] = []
     for fact in stale_candidates:
         fid = fact.get("id", "?")
-        cat = str(fact.get("category", "context")).strip() or "context"
-        conf = fact.get("confidence", 0.0)
+        cat = html.escape(str(fact.get("category", "context")).strip() or "context")
+        conf = _coerce_source_confidence(fact)
         created_raw = fact.get("createdAt", "")
         created_short = created_raw[:10] if isinstance(created_raw, str) and len(created_raw) >= 10 else created_raw
-        content = str(fact.get("content", ""))
+        content = html.escape(str(fact.get("content", "")))
         lines.append(f'- [{fid} | {cat} | {conf:.2f} | {created_short}] "{content}"')
     return STALENESS_REVIEW_PROMPT.format(
         stale_facts="\n".join(lines),
@@ -442,6 +442,34 @@ def _build_consolidation_section(
         shown = min(len(group), max_sources)
         parts.append(f'<consolidation_candidates category="{html.escape(cat)}" count="{shown}">\n' + "\n".join(lines) + "\n</consolidation_candidates>")
     return CONSOLIDATION_PROMPT.format(consolidation_groups="\n\n".join(parts), max_groups=max_groups)
+
+
+def _escape_memory_for_prompt(memory: Any) -> Any:
+    """Return a copy of ``memory`` with every string leaf HTML-escaped.
+
+    ``MEMORY_UPDATE_PROMPT`` embeds the full memory state as a ``json.dumps``
+    blob inside a ``<current_memory>...</current_memory>`` block. ``json.dumps``
+    escapes ``"`` and ``\\`` but leaves ``<``, ``>`` and ``&`` intact, so a
+    user-influenced field - e.g. a fact ``content`` of
+    ``</current_memory><evil>...`` - would otherwise reach the model verbatim
+    and break out of the block (prompt injection, #4044).
+
+    Escaping each string *value* before serialization (rather than the
+    serialized blob) cannot corrupt the JSON structure, because ``json.dumps``
+    re-quotes the already-safe values. Escaping every leaf - not just known
+    fields - guarantees no current or future user-influenced field can carry a
+    raw ``<``/``>``/``&``; controlled fields such as ids and timestamps contain
+    none of those characters, so escaping them is a harmless no-op. This mirrors
+    the ``html.escape`` treatment already applied to the staleness and
+    consolidation sections (#4028).
+    """
+    if isinstance(memory, str):
+        return html.escape(memory)
+    if isinstance(memory, dict):
+        return {key: _escape_memory_for_prompt(value) for key, value in memory.items()}
+    if isinstance(memory, list):
+        return [_escape_memory_for_prompt(item) for item in memory]
+    return memory
 
 
 class MemoryUpdater:
@@ -625,7 +653,7 @@ class MemoryUpdater:
                 )
 
         prompt = MEMORY_UPDATE_PROMPT.format(
-            current_memory=json.dumps(current_memory, indent=2, ensure_ascii=False),
+            current_memory=json.dumps(_escape_memory_for_prompt(current_memory), indent=2, ensure_ascii=False),
             conversation=conversation_text,
             correction_hint=correction_hint,
             staleness_review_section=staleness_section,
@@ -679,6 +707,49 @@ class MemoryUpdater:
         )
 
     def _do_update_memory_sync(
+        self,
+        messages: list[Any],
+        thread_id: str | None = None,
+        agent_name: str | None = None,
+        correction_detected: bool = False,
+        reinforcement_detected: bool = False,
+        user_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> bool:
+        """Pure-sync memory update; bind ``trace_id`` into the request-trace
+        ContextVar for the worker thread, then delegate to the impl.
+
+        The update runs on a Timer / executor thread with no request ContextVar
+        inheritance, so log records emitted here would otherwise lose the
+        request trace id (it only reached ``tracing_callback`` before). The
+        host-injected ``trace_context_manager`` hook (``None`` when DeerMem runs
+        standalone, outside the deer-flow factory) binds ``trace_id`` for the
+        duration of the call and restores the prior binding on exit. A ``None``
+        trace_id leaves the ContextVar untouched (no fabricated id).
+        """
+        cm = self._config.trace_context_manager
+        if cm is not None and trace_id is not None:
+            with cm(trace_id):
+                return self._do_update_memory_sync_impl(
+                    messages=messages,
+                    thread_id=thread_id,
+                    agent_name=agent_name,
+                    correction_detected=correction_detected,
+                    reinforcement_detected=reinforcement_detected,
+                    user_id=user_id,
+                    trace_id=trace_id,
+                )
+        return self._do_update_memory_sync_impl(
+            messages=messages,
+            thread_id=thread_id,
+            agent_name=agent_name,
+            correction_detected=correction_detected,
+            reinforcement_detected=reinforcement_detected,
+            user_id=user_id,
+            trace_id=trace_id,
+        )
+
+    def _do_update_memory_sync_impl(
         self,
         messages: list[Any],
         thread_id: str | None = None,
@@ -880,7 +951,7 @@ class MemoryUpdater:
                 max_stale = config.staleness_max_removals_per_cycle
                 if len(stale_ids_to_remove) > max_stale:
                     stale_facts = [f for f in current_memory.get("facts", []) if f.get("id") in stale_ids_to_remove]
-                    stale_facts.sort(key=lambda f: f.get("confidence", 0))
+                    stale_facts.sort(key=_coerce_source_confidence)
                     stale_ids_to_remove = {f["id"] for f in stale_facts[:max_stale]}
 
                 current_memory["facts"] = [f for f in current_memory.get("facts", []) if f.get("id") not in stale_ids_to_remove]

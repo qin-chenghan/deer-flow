@@ -146,7 +146,7 @@ class DeerMemConfig(BaseModel):
     # ── LLM (step 13: structured model sub-config consumed by core/llm.py build_llm) ──
     model: DeerMemModelConfig = Field(
         default_factory=DeerMemModelConfig,
-        description="Memory-update LLM config (provider/model/api_key/base_url/temperature). Empty = no LLM (non-LLM ops still work; an update raises).",
+        description=("Memory-update LLM config (provider/model/api_key/base_url/temperature). Empty = the host factory injects its default chat model as ``host_llm`` (zero-config UX, mirrors pre-abstraction ``model_name: null``); when ``host_llm`` is also absent (standalone DeerMem) an update raises but non-LLM ops still work."),
     )
     # ── Hooks (steps 14-15: optional host-injected callables; None = DeerMem defaults) ──
     tracing_callback: Any = Field(
@@ -162,6 +162,28 @@ class DeerMemConfig(BaseModel):
     should_keep_hidden_message: Any = Field(
         default=None,
         description=("Optional ``hook(additional_kwargs) -> bool``; when set, ``hide_from_ui`` messages are kept if it returns True. None = skip all ``hide_from_ui`` (host-agnostic safe default). Set programmatically."),
+    )
+    host_llm: Any = Field(
+        default=None,
+        description=(
+            "Host-injected pre-built chat model for memory extraction (zero-config "
+            "UX). The deer-flow factory injects its default model here when "
+            "``model`` is empty, mirroring pre-abstraction ``model_name: null`` -> "
+            "app default. Takes precedence over ``build_llm(model)``. None = build "
+            "from ``model`` (or no LLM when ``model`` is also empty). Set "
+            "programmatically (an instance cannot come from YAML)."
+        ),
+    )
+    trace_context_manager: Any = Field(
+        default=None,
+        description=(
+            "Host-injected context-manager callable ``cm(trace_id)`` that binds "
+            "``trace_id`` into the host request-trace ContextVar for the memory-"
+            "update worker thread (Timer / executor), restoring structured-log "
+            "trace correlation. None = no binding (DeerMem standalone; trace_id "
+            "still reaches ``tracing_callback`` and the log message text). Set "
+            "programmatically."
+        ),
     )
 
     @classmethod

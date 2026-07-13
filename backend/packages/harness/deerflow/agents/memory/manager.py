@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import os
 import threading
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -133,8 +134,12 @@ class MemoryManager(ABC):
         *,
         user_id: str | None = None,
         agent_name: str | None = None,
+        category: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Search the bucket's memory for facts matching ``query``; return up to ``top_k`` ranked by relevance."""
+        """Search the bucket's memory for facts matching ``query``; return up to
+        ``top_k`` ranked by relevance. ``category`` (optional) filters BEFORE the
+        ``top_k`` slice so a category-scoped search is not starved by other
+        categories' higher-ranked facts."""
 
     # ── Manage ───────────────────────────────────────────────────────────
     @abstractmethod
@@ -237,38 +242,47 @@ def _resolve_manager_class(manager_class: str) -> type[MemoryManager]:
     Resolution order:
       1. Registered short name (from :func:`_scan_backends`).
       2. Dotted import path (``pkg.mod:Cls`` or ``pkg.mod.Cls``).
-      3. Fall back to DeerMem on any failure (the default backend).
+
+    A value that resolves to neither is a config error: raise rather than
+    silently fall back to a different storage backend. Memory is persistent
+    state, so silently substituting DeerMem when an explicit ``manager_class``
+    fails to resolve (typo / import error / missing attr) would route writes to
+    the wrong store -- a silent data-integrity footgun. Fail loud (the manager
+    is resolved eagerly at startup so it can be warmed) so the operator fixes
+    ``memory.manager_class`` instead of discovering the mismatch later.
     """
     registry = _scan_backends()
     if manager_class in registry:
         return registry[manager_class]
 
     # Treat as a dotted path: support both "pkg.mod:Cls" and "pkg.mod.Cls".
-    try:
-        if ":" in manager_class:
-            module_path, _, attr = manager_class.partition(":")
-        else:
-            module_path, _, attr = manager_class.rpartition(".")
-        if module_path and attr:
+    dotted_error: str | None = None
+    if ":" in manager_class:
+        module_path, _, attr = manager_class.partition(":")
+    else:
+        module_path, _, attr = manager_class.rpartition(".")
+    if module_path and attr:
+        try:
             module = importlib.import_module(module_path)
-            cls = getattr(module, attr)
-            if isinstance(cls, type) and issubclass(cls, MemoryManager):
+        except ImportError as e:
+            dotted_error = f"cannot import module {module_path!r}: {e}"
+        else:
+            cls = getattr(module, attr, None)
+            if cls is None:
+                dotted_error = f"attribute {attr!r} not found in {module_path!r}"
+            elif not (isinstance(cls, type) and issubclass(cls, MemoryManager)):
+                dotted_error = f"{manager_class!r} resolved to non-MemoryManager {cls!r}"
+            else:
                 return cls
-            logger.warning("manager_class path %r resolved to non-MemoryManager %r", manager_class, cls)
-    except Exception as e:  # noqa: BLE001 - a typo'd manager_class is a config error, not a crash; warn + fall back
-        logger.warning("Failed to resolve manager_class=%r as a dotted path; falling back to DeerMem: %s", manager_class, e)
 
-    # Fallback: DeerMem (the default backend). The default backend must be
-    # importable; if it is not there is no further fallback, so surface a clear
-    # error rather than a raw import traceback (mirrors the defensive style of
-    # get_memory_storage's fallback, which has a concrete default to fall to).
-    logger.warning("Falling back to DeerMem memory backend (manager_class=%r unresolved)", manager_class)
-    try:
-        from deerflow.agents.memory.backends.deermem.deer_mem import DeerMem
-    except Exception:  # noqa: BLE001
-        logger.exception("DeerMem default backend failed to import; no memory backend available")
-        raise RuntimeError("DeerMem default memory backend could not be imported") from None
-    return DeerMem
+    raise ValueError(
+        f"memory.manager_class={manager_class!r} is not a registered backend name "
+        f"(known: {sorted(registry)}) nor a resolvable 'pkg.mod:Cls' path"
+        + (f": {dotted_error}" if dotted_error else "")
+        + ". Fix memory.manager_class in config; refusing to silently fall back to a "
+        f"different storage backend (memory is persistent state -- a wrong store is a "
+        f"silent data-integrity footgun)."
+    )
 
 
 # ── Host-default hooks (injected into backend_config by the factory) ──────
@@ -307,7 +321,9 @@ def _host_default_tracing_callback(
         invoke_config,
         thread_id=thread_id,
         user_id=user_id,
+        assistant_id="lead-agent",
         model_name=model_name,
+        environment=os.environ.get("DEER_FLOW_ENV") or os.environ.get("ENVIRONMENT"),
         deerflow_trace_id=trace_id,
     )
 
@@ -324,6 +340,24 @@ def _host_default_should_keep_hidden_message(additional_kwargs: Any) -> bool:
     from deerflow.agents.human_input import read_human_input_response
 
     return read_human_input_response(additional_kwargs) is not None
+
+
+def _host_default_llm() -> Any:
+    """deer-flow default for DeerMem's ``host_llm`` slot (zero-config extraction).
+
+    Builds the host's default chat model (``create_chat_model(name=None)`` ->
+    app default, ``attach_tracing=True`` so memory LLM calls surface in langfuse
+    via the metadata ``tracing_callback`` merges), mirroring pre-abstraction
+    ``model_name: null``. Returns ``None`` if no model is available (no models
+    configured) so DeerMem no-ops extraction with a clear error rather than
+    crashing startup.
+    """
+    try:
+        from deerflow.models import create_chat_model
+        return create_chat_model(name=None)
+    except Exception:  # noqa: BLE001 - no default model is a config state, not a crash
+        logger.warning("Could not build host default model for DeerMem memory extraction; memory extraction will be disabled", exc_info=True)
+        return None
 
 
 # ── Singleton factory ─────────────────────────────────────────────────────
@@ -369,6 +403,19 @@ def get_memory_manager() -> MemoryManager:
             backend_config["tracing_callback"] = _host_default_tracing_callback
         if "should_keep_hidden_message" not in backend_config:
             backend_config["should_keep_hidden_message"] = _host_default_should_keep_hidden_message
+        # Zero-config LLM: when no memory model is configured, inject the host's
+        # default chat model so memory extraction works out of the box (mirrors
+        # pre-abstraction `model_name: null` -> app default). DeerMem prefers
+        # host_llm over build_llm(model); other backends ignore the slot.
+        model_cfg = backend_config.get("model")
+        if not (isinstance(model_cfg, dict) and model_cfg.get("model")) and "host_llm" not in backend_config:
+            backend_config["host_llm"] = _host_default_llm()
+        # Restore structured-log trace correlation on the memory-update worker
+        # thread (Timer / executor): bind trace_id into the request-trace
+        # ContextVar. A None trace_id is left unbound by the updater's guard.
+        if "trace_context_manager" not in backend_config:
+            from deerflow.trace_context import request_trace_context
+            backend_config["trace_context_manager"] = request_trace_context
         _memory_manager = cls(backend_config=backend_config)
         logger.info("Memory manager resolved: %s (manager_class=%r)", cls.__name__, manager_class)
         return _memory_manager

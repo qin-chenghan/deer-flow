@@ -339,19 +339,28 @@ async def get_memory_config_endpoint() -> MemoryConfigResponse:
     """Get the memory system configuration.
 
     Returns:
-        The current memory configuration settings.
+        The current memory configuration. The response is backend-agnostic:
+        ``enabled`` / ``injection_enabled`` are mechanism-level gates that apply
+        to any backend, and ``backend_config`` is an opaque dict the active
+        backend (``manager_class``) self-interprets. DeerMem's knobs
+        (``storage_path``, ``max_facts``, ``debounce_seconds``, ...) live under
+        ``backend_config`` -- they are NOT top-level, because a non-DeerMem
+        backend has its own (different) knobs.
 
     Example Response:
         ```json
         {
             "enabled": true,
-            "storage_path": ".deer-flow/memory.json",
-            "debounce_seconds": 30,
-            "max_facts": 100,
-            "fact_confidence_threshold": 0.7,
             "injection_enabled": true,
-            "max_injection_tokens": 2000,
-            "token_counting": "tiktoken"
+            "manager_class": "deermem",
+            "backend_config": {
+                "storage_path": "/.../.deer-flow",
+                "debounce_seconds": 30,
+                "max_facts": 100,
+                "fact_confidence_threshold": 0.7,
+                "max_injection_tokens": 2000,
+                "token_counting": "tiktoken"
+            }
         }
         ```
     """

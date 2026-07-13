@@ -76,9 +76,8 @@ def memory_search_tool(
             top_k=limit,
             user_id=user_id,
             agent_name=agent_name,
+            category=category,
         )
-        if category is not None:
-            results = [fact for fact in results if fact.get("category") == category]
         return json.dumps({"results": results, "count": len(results)}, ensure_ascii=False)
     except Exception as exc:
         logger.exception("memory_search_tool failed")

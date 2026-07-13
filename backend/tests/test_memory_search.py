@@ -1,9 +1,9 @@
 """Tests for DeerMem.search (the ABC search implementation).
 
 DeerMem.search is a case-insensitive substring search over stored facts
-(stand-in for the planned semantic retrieval). Category filtering is not on
-the ABC ``search`` signature; it lives in the ``memory_search`` tool
-(see test_memory_tools.py). These tests cover the backend's own search.
+(stand-in for the planned semantic retrieval). The optional ``category`` kwarg
+filters BEFORE the ``top_k`` slice (it is on the ABC signature; the
+``memory_search`` tool forwards it). These tests cover the backend's own search.
 """
 
 from types import SimpleNamespace
@@ -116,3 +116,34 @@ class TestDeerMemSearch:
         results = mgr.search("uv")
         assert len(results) == 1
         assert results[0]["id"] == "f1"
+
+    def test_category_filters_before_top_k_slice(self):
+        """category filters BEFORE the top_k slice, so a category-scoped search
+        is not starved by higher-confidence facts in other categories."""
+        facts = [
+            _make_fact("uv fast", "preference", 0.9),
+            _make_fact("uv tool", "context", 0.95),
+            _make_fact("uv python", "context", 0.9),
+            _make_fact("uv rust", "context", 0.85),
+        ]
+        mgr = _deer_mem_with_facts(facts)
+
+        # top_k=1 without category -> the single highest-confidence fact (context, 0.95)
+        assert mgr.search("uv", top_k=1)[0]["category"] == "context"
+        # top_k=1 WITH category=preference -> the preference fact (0.9), not
+        # starved by the higher-confidence context facts that would otherwise
+        # occupy the top_k slice first.
+        pref = mgr.search("uv", top_k=1, category="preference")
+        assert len(pref) == 1
+        assert pref[0]["category"] == "preference"
+        assert pref[0]["content"] == "uv fast"
+
+    def test_category_none_returns_all_categories(self):
+        """category=None (default) returns facts from all categories."""
+        facts = [
+            _make_fact("uv a", "preference", 0.9),
+            _make_fact("uv b", "context", 0.5),
+        ]
+        mgr = _deer_mem_with_facts(facts)
+
+        assert len(mgr.search("uv", category=None)) == 2

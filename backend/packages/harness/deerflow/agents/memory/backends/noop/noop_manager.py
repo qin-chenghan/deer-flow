@@ -111,6 +111,7 @@ class NoopMemoryManager(MemoryManager):
         *,
         user_id: str | None = None,
         agent_name: str | None = None,
+        category: str | None = None,
     ) -> list[dict[str, Any]]:
         return []
 

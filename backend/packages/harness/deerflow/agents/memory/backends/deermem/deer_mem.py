@@ -38,7 +38,7 @@ from .deermem.core.message_processing import (
 from .deermem.core.prompt import format_memory_for_injection, warm_tiktoken_cache
 from .deermem.core.queue import MemoryUpdateQueue
 from .deermem.core.storage import create_storage
-from .deermem.core.updater import MemoryUpdater
+from .deermem.core.updater import MemoryUpdater, _coerce_source_confidence
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +56,10 @@ class DeerMem(MemoryManager):
         """
         self._config = DeerMemConfig.from_backend_config(backend_config)
         self._storage = create_storage(self._config)
-        self._llm = build_llm(self._config.model)
+        # host_llm (host-injected default model) takes precedence over build_llm(model)
+        # so zero-config DeerMem (empty `model`) still extracts via the app default,
+        # mirroring pre-abstraction `model_name: null`. Standalone (no factory) -> None.
+        self._llm = self._config.host_llm if self._config.host_llm is not None else build_llm(self._config.model)
         self._updater = MemoryUpdater(self._config, self._storage, self._llm)
         self._queue = MemoryUpdateQueue(self._config, self._updater)
 
@@ -170,12 +173,15 @@ class DeerMem(MemoryManager):
         *,
         user_id: str | None = None,
         agent_name: str | None = None,
+        category: str | None = None,
     ) -> list[dict[str, Any]]:
         """Case-insensitive substring search over stored facts.
 
         Stand-in for the planned BM25+vector+MMR retrieval
         (``core/retrieval.py``): returns facts whose ``content`` contains the
-        query, ranked by confidence desc, capped at ``top_k``. Sufficient for
+        query, ranked by confidence desc, capped at ``top_k``. ``category``
+        filters BEFORE the ``top_k`` slice so a category-scoped search is not
+        starved by higher-confidence facts in other categories. Sufficient for
         the tool-driven memory mode; upgrade to semantic retrieval later
         without changing call sites.
         """
@@ -183,8 +189,14 @@ class DeerMem(MemoryManager):
             return []
         query_lower = query.strip().lower()
         memory_data = self._updater.get_memory_data(agent_name=agent_name, user_id=user_id)
-        matched = [fact for fact in memory_data.get("facts", []) if isinstance(fact.get("content"), str) and query_lower in fact["content"].lower()]
-        matched.sort(key=lambda f: f.get("confidence", 0), reverse=True)
+        matched = [
+            fact
+            for fact in memory_data.get("facts", [])
+            if isinstance(fact.get("content"), str)
+            and query_lower in fact["content"].lower()
+            and (category is None or fact.get("category") == category)
+        ]
+        matched.sort(key=_coerce_source_confidence, reverse=True)
         return matched[:top_k]
 
     # ── Manage ───────────────────────────────────────────────────────────
