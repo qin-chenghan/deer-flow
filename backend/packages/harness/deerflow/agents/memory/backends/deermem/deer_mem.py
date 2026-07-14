@@ -37,6 +37,7 @@ from .deermem.core.message_processing import (
 )
 from .deermem.core.prompt import format_memory_for_injection, warm_tiktoken_cache
 from .deermem.core.queue import MemoryUpdateQueue
+from .deermem.core.retrieval import FTS5Retrieval
 from .deermem.core.storage import create_storage
 from .deermem.core.updater import MemoryUpdater, _coerce_source_confidence
 
@@ -62,6 +63,9 @@ class DeerMem(MemoryManager):
         self._llm = self._config.host_llm if self._config.host_llm is not None else build_llm(self._config.model)
         self._updater = MemoryUpdater(self._config, self._storage, self._llm)
         self._queue = MemoryUpdateQueue(self._config, self._updater)
+        # FTS5 retrieval engine (in-memory; rebuilt lazily on first search)
+        self._retrieval: FTS5Retrieval | None = None
+        self._retrieval_dirty = True  # index needs rebuild
 
     # ── Write ────────────────────────────────────────────────────────────
     def add(
@@ -175,18 +179,74 @@ class DeerMem(MemoryManager):
         agent_name: str | None = None,
         category: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Case-insensitive substring search over stored facts.
+        """Search stored facts by query.
 
-        Stand-in for the planned BM25+vector+MMR retrieval
-        (``core/retrieval.py``): returns facts whose ``content`` contains the
-        query, ranked by confidence desc, capped at ``top_k``. ``category``
-        filters BEFORE the ``top_k`` slice so a category-scoped search is not
-        starved by higher-confidence facts in other categories. Sufficient for
-        the tool-driven memory mode; upgrade to semantic retrieval later
-        without changing call sites.
+        Uses FTS5 BM25 retrieval when available (with jieba Chinese
+        tokenization, advanced query syntax, and time-decay + confidence
+        weighting). Falls back to case-insensitive substring matching
+        when FTS5 is unavailable or returns no results.
+
+        ``category`` filters BEFORE the ``top_k`` slice so a category-scoped
+        search is not starved by higher-confidence facts in other categories.
         """
         if not query or not query.strip() or top_k <= 0:
             return []
+
+        # Try FTS5 retrieval first
+        results = self._fts5_search(query, top_k=top_k, user_id=user_id, agent_name=agent_name, category=category)
+        if results:
+            return results
+
+        # Fallback: case-insensitive substring search
+        return self._substring_search(query, top_k=top_k, user_id=user_id, agent_name=agent_name, category=category)
+
+    def _ensure_retrieval_index(self, user_id: str | None, agent_name: str | None) -> FTS5Retrieval | None:
+        """Lazily build/rebuild the FTS5 index from current facts."""
+        if self._retrieval is None:
+            self._retrieval = FTS5Retrieval(":memory:")
+            self._retrieval_dirty = True
+        if self._retrieval_dirty:
+            memory_data = self._updater.get_memory_data(agent_name=agent_name, user_id=user_id)
+            facts = memory_data.get("facts", [])
+            self._retrieval.rebuild_from_facts(facts, scope_user=user_id, scope_agent=agent_name)
+            self._retrieval_dirty = False
+        return self._retrieval
+
+    def _fts5_search(
+        self,
+        query: str,
+        *,
+        top_k: int,
+        user_id: str | None,
+        agent_name: str | None,
+        category: str | None,
+    ) -> list[dict[str, Any]]:
+        """FTS5 BM25 search. Returns empty list on any failure."""
+        try:
+            retrieval = self._ensure_retrieval_index(user_id, agent_name)
+            if retrieval is None:
+                return []
+            return retrieval.search(
+                query,
+                scope_user=user_id,
+                scope_agent=agent_name,
+                category=category,
+                top_k=top_k,
+            )
+        except Exception:
+            logger.debug("FTS5 search failed, falling back to substring", exc_info=True)
+            return []
+
+    def _substring_search(
+        self,
+        query: str,
+        *,
+        top_k: int,
+        user_id: str | None,
+        agent_name: str | None,
+        category: str | None,
+    ) -> list[dict[str, Any]]:
+        """Case-insensitive substring search (original implementation)."""
         query_lower = query.strip().lower()
         memory_data = self._updater.get_memory_data(agent_name=agent_name, user_id=user_id)
         matched = [fact for fact in memory_data.get("facts", []) if isinstance(fact.get("content"), str) and query_lower in fact["content"].lower() and (category is None or fact.get("category") == category)]
@@ -217,7 +277,9 @@ class DeerMem(MemoryManager):
         user_id: str | None = None,
         agent_name: str | None = None,
     ) -> dict[str, Any]:
-        return self._updater.clear_memory_data(agent_name=agent_name, user_id=user_id)
+        result = self._updater.clear_memory_data(agent_name=agent_name, user_id=user_id)
+        self._retrieval_dirty = True
+        return result
 
     def import_memory(
         self,
@@ -226,7 +288,9 @@ class DeerMem(MemoryManager):
         user_id: str | None = None,
         agent_name: str | None = None,
     ) -> dict[str, Any]:
-        return self._updater.import_memory_data(memory_data, agent_name=agent_name, user_id=user_id)
+        result = self._updater.import_memory_data(memory_data, agent_name=agent_name, user_id=user_id)
+        self._retrieval_dirty = True
+        return result
 
     def export_memory(
         self,
@@ -260,7 +324,9 @@ class DeerMem(MemoryManager):
         agent_name: str | None = None,
     ) -> dict[str, Any]:
         """Drop the cached memory document and reload from disk."""
-        return self._updater.reload_memory_data(agent_name=agent_name, user_id=user_id)
+        result = self._updater.reload_memory_data(agent_name=agent_name, user_id=user_id)
+        self._retrieval_dirty = True
+        return result
 
     def create_fact(
         self,
@@ -278,6 +344,8 @@ class DeerMem(MemoryManager):
             agent_name=agent_name,
             user_id=user_id,
         )
+        self._retrieval_dirty = True
+        return memory_data, fact_id
 
     def delete_fact(
         self,
@@ -286,7 +354,9 @@ class DeerMem(MemoryManager):
         agent_name: str | None = None,
         user_id: str | None = None,
     ) -> dict[str, Any]:
-        return self._updater.delete_memory_fact(fact_id, agent_name=agent_name, user_id=user_id)
+        result = self._updater.delete_memory_fact(fact_id, agent_name=agent_name, user_id=user_id)
+        self._retrieval_dirty = True
+        return result
 
     def update_fact(
         self,
@@ -298,7 +368,7 @@ class DeerMem(MemoryManager):
         agent_name: str | None = None,
         user_id: str | None = None,
     ) -> dict[str, Any]:
-        return self._updater.update_memory_fact(
+        result = self._updater.update_memory_fact(
             fact_id,
             content=content,
             category=category,
@@ -306,3 +376,5 @@ class DeerMem(MemoryManager):
             agent_name=agent_name,
             user_id=user_id,
         )
+        self._retrieval_dirty = True
+        return result
