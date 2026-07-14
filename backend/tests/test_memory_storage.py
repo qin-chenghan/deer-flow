@@ -153,17 +153,24 @@ class TestCreateStorage:
         """Empty storage_class (default) -> FileMemoryStorage directly."""
         assert isinstance(create_storage(DeerMemConfig()), FileMemoryStorage)
 
-    def test_falls_back_to_file_memory_storage_on_error(self):
-        storage = create_storage(DeerMemConfig(storage_class="non.existent.StorageClass"))
-        assert isinstance(storage, FileMemoryStorage)
+    def test_raises_on_unresolvable_storage_class(self):
+        """An unimportable storage_class raises ValueError (fail-fast), not a silent
+        FileMemoryStorage fallback -- memory is persistent state, so a wrong store
+        is a data-integrity footgun. Mirrors the manager_class resolution policy."""
+        with pytest.raises(ValueError, match="storage_class"):
+            create_storage(DeerMemConfig(storage_class="non.existent.StorageClass"))
 
-    def test_invalid_class_fallback(self):
-        storage = create_storage(DeerMemConfig(storage_class="os.path.join"))
-        assert isinstance(storage, FileMemoryStorage)
+    def test_raises_on_non_class_storage_class(self):
+        """A storage_class that resolves to a non-class (e.g. a function) raises
+        ValueError, not a silent fallback to FileMemoryStorage."""
+        with pytest.raises(ValueError, match="storage_class"):
+            create_storage(DeerMemConfig(storage_class="os.path.join"))
 
-    def test_non_subclass_fallback(self):
-        storage = create_storage(DeerMemConfig(storage_class="builtins.dict"))
-        assert isinstance(storage, FileMemoryStorage)
+    def test_raises_on_non_subclass_storage_class(self):
+        """A storage_class that is not a MemoryStorage subclass raises ValueError,
+        not a silent fallback to FileMemoryStorage."""
+        with pytest.raises(ValueError, match="storage_class"):
+            create_storage(DeerMemConfig(storage_class="builtins.dict"))
 
     def test_dotted_storage_class_resolves(self):
         storage = create_storage(DeerMemConfig(storage_class="deerflow.agents.memory.backends.deermem.deermem.core.storage.FileMemoryStorage"))

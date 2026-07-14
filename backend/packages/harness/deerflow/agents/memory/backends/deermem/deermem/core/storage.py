@@ -168,7 +168,10 @@ def create_storage(config: DeerMemConfig) -> MemoryStorage:
     Replaces the old ``get_memory_storage()`` global singleton: the caller
     (``DeerMem.__init__``) owns the returned instance. Empty ``storage_class``
     (default) -> ``FileMemoryStorage`` directly (no importlib, portable); a
-    dotted path is resolved and falls back to ``FileMemoryStorage`` on failure.
+    dotted path is resolved and raises ``ValueError`` on failure (fail-fast:
+    memory is persistent state, so an unresolved ``storage_class`` is not
+    silently substituted with ``FileMemoryStorage`` -- mirrors the
+    ``manager_class`` resolution policy).
     """
     storage_class_path = config.storage_class
     if not storage_class_path:
@@ -189,9 +192,10 @@ def create_storage(config: DeerMemConfig) -> MemoryStorage:
 
         return storage_class(config)
     except Exception as e:
-        logger.error(
-            "Failed to load memory storage %s, falling back to FileMemoryStorage: %s",
-            storage_class_path,
-            e,
-        )
-        return FileMemoryStorage(config)
+        raise ValueError(
+            f"backend_config.storage_class={storage_class_path!r} failed to load: {e}. "
+            "Refusing to silently fall back to FileMemoryStorage - memory is persistent "
+            "state, so a wrong store is a silent data-integrity footgun (a misspelled "
+            "class path would otherwise write every fact to local JSON instead of the "
+            "intended backend)."
+        ) from e

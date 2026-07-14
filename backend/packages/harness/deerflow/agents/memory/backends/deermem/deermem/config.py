@@ -16,9 +16,12 @@ optional host-injected hooks (None = DeerMem defaults).
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
 
 
 class DeerMemModelConfig(BaseModel):
@@ -194,8 +197,20 @@ class DeerMemConfig(BaseModel):
 
     @classmethod
     def from_backend_config(cls, backend_config: dict[str, Any] | None) -> DeerMemConfig:
-        """Parse a ``backend_config`` dict; unknown keys ignored (forward-compat)."""
+        """Parse a ``backend_config`` dict.
+
+        Unknown keys are ignored (forward-compat) but logged at WARNING so a
+        typo (e.g. ``storage_pat`` missing the ``h``) does not silently fall
+        back to the default and write memory to an unintended location --
+        mirrors the host layer's ``load_memory_config_from_dict`` warning.
+        """
         if not backend_config:
             return cls()
         known = {k: v for k, v in backend_config.items() if k in cls.model_fields}
+        unknown = sorted(k for k in backend_config if k not in cls.model_fields)
+        if unknown:
+            logger.warning(
+                "Unknown backend_config keys ignored by DeerMem; check for typos: %s",
+                unknown,
+            )
         return cls(**known)

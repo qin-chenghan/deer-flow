@@ -338,3 +338,61 @@ def test_is_human_clarification_response_matches_host_read():
         host_keeps = read_human_input_response(ak) is not None
         mirror_keeps = _is_human_clarification_response(ak)
         assert host_keeps == mirror_keeps, f"divergence on {ak!r}: host={host_keeps} mirror={mirror_keeps}"
+
+
+def test_build_llm_returns_none_when_no_model_configured():
+    """Zero-config (no model_config, or model_config with no model) -> None.
+    Non-LLM ops still work; an update raises at runtime."""
+    from deerflow.agents.memory.backends.deermem.deermem.config import DeerMemModelConfig
+    from deerflow.agents.memory.backends.deermem.deermem.core.llm import build_llm
+
+    assert build_llm(None) is None
+    assert build_llm(DeerMemModelConfig()) is None  # model=None default
+
+
+def test_build_llm_degrades_to_none_on_init_failure(caplog):
+    """build_llm degrades to None (with a WARNING) when init_chat_model fails,
+    mirroring _host_default_llm -- so a misconfigured explicit ``model`` does
+    NOT crash app startup. Memory CRUD/read/search still work; extraction is
+    disabled; an update raises at runtime with the underlying error logged."""
+    from unittest.mock import patch
+
+    from deerflow.agents.memory.backends.deermem.deermem.config import DeerMemModelConfig
+    from deerflow.agents.memory.backends.deermem.deermem.core.llm import build_llm
+
+    model_config = DeerMemModelConfig(provider="openai", model="bogus-model", api_key="k")
+    llm_logger = "deerflow.agents.memory.backends.deermem.deermem.core.llm"
+
+    with patch("langchain.chat_models.init_chat_model", side_effect=RuntimeError("boom")):
+        with caplog.at_level("WARNING", logger=llm_logger):
+            result = build_llm(model_config)
+
+    assert result is None
+    assert any("build_llm failed" in r.message for r in caplog.records)
+
+
+def test_from_backend_config_warns_on_unknown_keys(caplog):
+    """Unknown backend_config keys log a WARNING so a typo (e.g. ``storage_pat``
+    missing the ``h``) does not silently fall back to the default and write
+    memory to an unintended location. Mirrors the host layer's
+    load_memory_config_from_dict warning."""
+    from deerflow.agents.memory.backends.deermem.deermem.config import DeerMemConfig
+
+    cfg_logger = "deerflow.agents.memory.backends.deermem.deermem.config"
+    with caplog.at_level("WARNING", logger=cfg_logger):
+        cfg = DeerMemConfig.from_backend_config({"storage_path": "/tmp/x", "storage_pat": "/tmp/y"})
+
+    # known key parsed; unknown key ignored but warned about
+    assert cfg.storage_path == "/tmp/x"
+    assert any("Unknown backend_config keys" in r.message for r in caplog.records)
+    assert any("storage_pat" in r.message for r in caplog.records)
+
+
+def test_from_backend_config_silent_on_known_keys(caplog):
+    """No warning when every key is known (regression guard for the typo warning)."""
+    from deerflow.agents.memory.backends.deermem.deermem.config import DeerMemConfig
+
+    cfg_logger = "deerflow.agents.memory.backends.deermem.deermem.config"
+    with caplog.at_level("WARNING", logger=cfg_logger):
+        DeerMemConfig.from_backend_config({"storage_path": "/tmp/x", "max_facts": 20})
+    assert not any("Unknown backend_config keys" in r.message for r in caplog.records)

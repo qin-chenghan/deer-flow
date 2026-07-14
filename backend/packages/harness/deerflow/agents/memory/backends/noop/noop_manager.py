@@ -168,11 +168,21 @@ class NoopMemoryManager(MemoryManager):
     #     ...  # your_store.delete(fact_id)
     #     return self.get_memory(user_id=user_id, agent_name=agent_name)
     #
-    # def create_fact(self, *, content, category=None, confidence=None,
-    #                 user_id=None, agent_name=None) -> dict:
-    #     """Manually add one memory (POST /memory/facts)."""
-    #     ...  # your_store.add(content)
-    #     return self.get_memory(user_id=user_id, agent_name=agent_name)
+    # def create_fact(self, content: str, category: str = "context",
+    #                 confidence: float = 0.5, *,
+    #                 user_id: str | None = None,
+    #                 agent_name: str | None = None,
+    # ) -> tuple[dict, str | None]:
+    #     """Manually add one memory (POST /memory/facts).
+    #
+    #     Returns ``(memory_data, fact_id)`` -- NOT a bare dict. ``content`` is
+    #     positional (the memory_add tool passes it positionally); ``fact_id``
+    #     is None when a storage cap (e.g. max_facts) evicted the just-added
+    #     fact, so the caller reports "not stored" instead of a dangling id.
+    #     Signatures must match what the gateway/client/tools call (see DeerMem).
+    #     """
+    #     ...  # your_store.add(content); fact_id = your_store.last_id()
+    #     return self.get_memory(user_id=user_id, agent_name=agent_name), fact_id
     #
     # def update_fact(self, *, fact_id, content=None, category=None,
     #                 confidence=None, user_id=None, agent_name=None) -> dict:
