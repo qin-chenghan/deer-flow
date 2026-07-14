@@ -18,6 +18,7 @@ Covered behavior:
 - `before_model` and `abefore_model` expose the same behavior sync/async.
 """
 
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -242,6 +243,51 @@ class TestCreateImageDetailsMessage:
         description_blocks = [b for b in blocks if b.get("type") == "text" and "/mystery.bin" in b.get("text", "")]
         assert len(description_blocks) == 1
         assert "unknown" in description_blocks[0]["text"]
+
+    def test_omits_image_url_when_read_raises_oserror(self, tmp_path, monkeypatch):
+        """A failure during on-demand read must not crash the middleware."""
+        img_meta = _make_viewed_image(tmp_path, "ok.png")
+        state = {
+            "viewed_images": {
+                "/ok.png": img_meta,
+            }
+        }
+
+        def _raise(*args, **kwargs):
+            raise OSError("disk error")
+
+        monkeypatch.setattr("builtins.open", _raise)
+
+        mw = ViewImageMiddleware()
+        blocks = mw._create_image_details_message(state)
+        # header + description + 'unavailable' text, no image_url block
+        assert all(not (isinstance(b, dict) and b.get("type") == "image_url") for b in blocks)
+        unavailable = [b for b in blocks if isinstance(b, dict) and b.get("type") == "text" and "unavailable" in b.get("text", "")]
+        assert len(unavailable) == 1
+
+    def test_omits_image_url_when_size_changes_between_view_and_inject(self, tmp_path):
+        """Defense against TOCTOU growth: skip if current size differs from recorded size."""
+        img_meta = _make_viewed_image(tmp_path, "shrinking.png", data=b"original-larger-content")
+        # Grow the file after the metadata was written
+        img_meta_path = Path(img_meta["actual_path"])
+        img_meta_path.write_bytes(b"much-much-much-larger-content-bytes")
+
+        state = {"viewed_images": {"/shrinking.png": img_meta}}
+        mw = ViewImageMiddleware()
+        blocks = mw._create_image_details_message(state)
+        assert all(not (isinstance(b, dict) and b.get("type") == "image_url") for b in blocks)
+
+    def test_omits_image_url_when_size_exceeds_cap(self, tmp_path):
+        """Records a small size but the actual file is large - the cap kicks in regardless."""
+        img_meta = _make_viewed_image(tmp_path, "huge.png", data=b"x" * 100)
+        img_meta_path = Path(img_meta["actual_path"])
+        # Grow past the cap (20 MB)
+        img_meta_path.write_bytes(b"y" * (21 * 1024 * 1024))
+
+        state = {"viewed_images": {"/huge.png": img_meta}}
+        mw = ViewImageMiddleware()
+        blocks = mw._create_image_details_message(state)
+        assert all(not (isinstance(b, dict) and b.get("type") == "image_url") for b in blocks)
 
 
 class TestShouldInjectImageMessage:
