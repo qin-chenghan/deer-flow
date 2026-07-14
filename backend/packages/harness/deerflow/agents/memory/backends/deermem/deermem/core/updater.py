@@ -70,6 +70,22 @@ def _coerce_source_confidence(fact: dict[str, Any]) -> float:
     return max(0.0, min(val, 1.0)) if math.isfinite(val) else 0.5
 
 
+def _trim_facts_to_max(facts: list[dict[str, Any]], max_facts: int) -> list[dict[str, Any]]:
+    """Keep the highest-confidence facts within ``max_facts`` (confidence coerced).
+
+    Confidence is read via :func:`_coerce_source_confidence` so legacy / imported
+    facts with ``null`` or non-numeric confidence never crash the sort -- the
+    pre-#4023 ``key=lambda f: f.get("confidence", 0)`` form compared ``None`` /
+    ``str`` against ``float`` and raised ``TypeError`` once ``len(facts) >
+    max_facts``. Mirrors upstream's ``_trim_facts_to_max`` (introduced in #4023)
+    so the vendored copy no longer lags the coercion fix the
+    monolithic->vendored rename silently dropped.
+    """
+    if len(facts) <= max_facts:
+        return facts
+    return sorted(facts, key=_coerce_source_confidence, reverse=True)[:max_facts]
+
+
 def _extract_text(content: Any) -> str:
     """Extract plain text from LLM response content (str or list of content blocks).
 
@@ -515,13 +531,21 @@ class MemoryUpdater:
             raise OSError("Failed to save cleared memory data")
         return cleared_memory
 
-    def create_memory_fact(self, content: str, category: str = "context", confidence: float = 0.5, agent_name: str | None = None, *, user_id: str | None = None) -> tuple[dict[str, Any], str]:
+    def create_memory_fact(self, content: str, category: str = "context", confidence: float = 0.5, agent_name: str | None = None, *, user_id: str | None = None) -> tuple[dict[str, Any], str | None]:
         """Create a new fact, persist it, and return ``(updated_memory, fact_id)``.
 
         The fact_id is returned directly so callers (e.g. the memory_add tool)
         don't have to re-derive it from the memory data by content matching --
         which would couple them to the backend's content normalization and could
         misreport a storage cap on backends that normalize differently.
+
+        The new fact is then trimmed by :func:`_trim_facts_to_max` (highest-
+        confidence wins, confidence coerced). If the cap evicts the just-added
+        (lower-confidence) fact, ``fact_id`` is ``None`` so callers report
+        "not stored - cap reached" instead of a dangling id with a false
+        "added" status. This restores both the max_facts cap and the post-trim
+        existence check (upstream's ``create_memory_fact_with_created_fact``),
+        which the vendored copy had dropped together to avoid the dangling id.
         """
         normalized_content = content.strip()
         if not normalized_content:
@@ -543,10 +567,13 @@ class MemoryUpdater:
                 "source": "manual",
             }
         )
-        updated_memory["facts"] = facts
+        updated_memory["facts"] = _trim_facts_to_max(facts, self._config.max_facts)
         if not self._save_memory_to_file(updated_memory, agent_name, user_id=user_id):
             raise OSError("Failed to save memory data after creating fact")
-        return updated_memory, fact_id
+        # If the cap evicted the just-added (lower-confidence) fact, signal via
+        # None so callers don't report a dangling id as "added".
+        stored = any(f.get("id") == fact_id for f in updated_memory["facts"])
+        return updated_memory, (fact_id if stored else None)
 
     def delete_memory_fact(self, fact_id: str, agent_name: str | None = None, *, user_id: str | None = None) -> dict[str, Any]:
         """Delete a fact by its id and persist the updated memory data."""
@@ -1005,14 +1032,8 @@ class MemoryUpdater:
                 if fact_key is not None:
                     existing_fact_keys.add(fact_key)
 
-        # Enforce max facts limit
-        if len(current_memory["facts"]) > config.max_facts:
-            # Sort by confidence and keep top ones
-            current_memory["facts"] = sorted(
-                current_memory["facts"],
-                key=lambda f: f.get("confidence", 0),
-                reverse=True,
-            )[: config.max_facts]
+        # Enforce max facts limit (coerced confidence -- see _trim_facts_to_max).
+        current_memory["facts"] = _trim_facts_to_max(current_memory["facts"], config.max_facts)
 
         # ── Memory consolidation ──
         # Runs after the max_facts trim so source facts that were just evicted

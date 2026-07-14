@@ -1294,7 +1294,9 @@ class DeerFlowClient:
         manager = get_memory_manager()
         if not hasattr(manager, "create_fact"):
             raise NotImplementedError(f"create_fact not supported by memory backend '{type(manager).__name__}'")
-        memory_data, _fact_id = manager.create_fact(content=content, category=category, confidence=confidence, user_id=get_effective_user_id())
+        memory_data, fact_id = manager.create_fact(content=content, category=category, confidence=confidence, user_id=get_effective_user_id())
+        if fact_id is None:
+            raise ValueError("Fact was not stored because memory.max_facts kept higher-confidence facts")
         return memory_data
 
     def delete_memory_fact(self, fact_id: str) -> dict:

@@ -212,6 +212,24 @@ class TestMemoryAddTool:
         result = json.loads(result_json)
         assert result["fact_id"] == "fact_new123"
 
+    def test_add_reports_not_stored_when_cap_evicts_new_fact(self, monkeypatch):
+        """When the cap evicts the new fact (create_fact returns None id), report
+        'not stored' instead of a dangling id + false 'added'."""
+        mgr = _MockManager(facts=[])
+        recorded = []
+
+        def fake_create(content, category="context", confidence=0.5, *, agent_name=None, user_id=None):
+            recorded.append(content)
+            return {"facts": []}, None
+
+        mgr.create_fact = fake_create
+        _install_manager(monkeypatch, mgr)
+
+        result_json = memory_add_tool.func(SimpleNamespace(context={}), "low confidence fact", confidence=0.1)
+        result = json.loads(result_json)
+        assert result == {"error": "Fact was not stored because memory.max_facts kept higher-confidence facts"}
+        assert recorded == ["low confidence fact"]
+
     def test_uses_runtime_scope(self, monkeypatch):
         """Should pass agent_name + user_id from runtime to the manager."""
         captured = {}

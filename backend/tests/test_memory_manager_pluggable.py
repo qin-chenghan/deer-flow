@@ -14,6 +14,8 @@ are independent of order.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from deerflow.agents.memory import (
@@ -100,3 +102,47 @@ def test_deermem_search_works_delete_export_are_stubs() -> None:
         deermem.delete_memory(user_id="u")
     with pytest.raises(NotImplementedError):
         deermem.export_memory(user_id="u")
+
+
+def test_factory_raises_when_storage_path_is_existing_file(tmp_path) -> None:
+    """A storage_path that resolves to an existing FILE is a config error: DeerMem
+    treats storage_path as a root directory, so a file would make save's mkdir
+    raise NotADirectoryError (silent write failure). Fail loud at startup (#1)."""
+    file_path = tmp_path / "mem.json"
+    file_path.write_text("{}", encoding="utf-8")
+    set_memory_config(MemoryConfig(manager_class="deermem", backend_config={"storage_path": str(file_path)}))
+    with pytest.raises(ValueError, match="existing file"):
+        get_memory_manager()
+
+
+def test_migration_drops_file_style_legacy_storage_path(caplog) -> None:
+    """A legacy top-level storage_path that looks like a file (ends in .json) is
+    dropped, not carried verbatim -- DeerMem now treats storage_path as a root
+    directory, so carrying 'memory.json' would orphan per-user memory / hit
+    NotADirectoryError. Dropping lets the factory inject runtime_home (per-user
+    location unchanged). Non-file legacy fields still migrate; empty values are
+    skipped silently (#1, #6)."""
+    from deerflow.config.memory_config import load_memory_config_from_dict
+
+    with caplog.at_level("WARNING", logger="deerflow.config.memory_config"):
+        load_memory_config_from_dict({"storage_path": "memory.json", "max_facts": 50})
+    cfg = get_memory_config()
+    assert "storage_path" not in cfg.backend_config  # file-style dropped
+    assert cfg.backend_config.get("max_facts") == 50  # non-file legacy still migrates
+    assert any("looks like a file path" in r.message for r in caplog.records)
+
+
+def test_empty_storage_path_factory_injects_runtime_home(tmp_path, monkeypatch) -> None:
+    """Empty/absent storage_path -> factory injects runtime_home() as the root, so
+    per-user memory lands at {runtime_home}/users/{uid}/memory.json (matches
+    pre-abstraction per-user location). Pins the zero-config default (reviewer #1)."""
+    import deerflow.config.runtime_paths as rp
+
+    monkeypatch.setattr(rp, "runtime_home", lambda: tmp_path)
+    set_memory_config(MemoryConfig(manager_class="deermem"))  # no storage_path
+    manager = get_memory_manager()
+    assert Path(manager._config.storage_path) == tmp_path
+    manager.create_fact("hello", user_id="u1")
+    # per-user dir created under the injected runtime_home root
+    user_dirs = [p.name for p in (tmp_path / "users").iterdir() if p.is_dir()]
+    assert len(user_dirs) == 1

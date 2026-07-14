@@ -319,7 +319,7 @@ def _host_default_tracing_callback(
         invoke_config,
         thread_id=thread_id,
         user_id=user_id,
-        assistant_id="lead-agent",
+        assistant_id="memory_agent",
         model_name=model_name,
         environment=os.environ.get("DEER_FLOW_ENV") or os.environ.get("ENVIRONMENT"),
         deerflow_trace_id=trace_id,
@@ -402,6 +402,20 @@ def get_memory_manager() -> MemoryManager:
             from deerflow.config.runtime_paths import runtime_home
 
             backend_config["storage_path"] = str((Path(runtime_home()) / backend_config["storage_path"]).resolve())
+        # Guard: DeerMem treats storage_path as a root DIRECTORY (per-user memory
+        # under {storage_path}/users/{uid}/memory.json). A file-style value (e.g. a
+        # leftover .json file from the pre-abstraction file-path semantics) would
+        # make FileMemoryStorage.save's mkdir(parents=True) raise NotADirectoryError,
+        # caught as OSError -> silent write failure. Fail loud at startup instead
+        # (memory is persistent state -- a wrong root is a data-integrity footgun).
+        _resolved_storage_path = Path(backend_config["storage_path"])
+        if _resolved_storage_path.is_file():
+            raise ValueError(
+                f"memory.backend_config.storage_path={backend_config['storage_path']!r} "
+                f"resolves to an existing file {_resolved_storage_path}; DeerMem treats "
+                f"storage_path as a root DIRECTORY (per-user memory under "
+                f"{{storage_path}}/users/{{uid}}/memory.json). Point it at a directory."
+            )
         # Host-default hooks: callables cannot come from YAML, so the host
         # injects them here. DeerMem consumes them (known config fields);
         # noop ignores them (unknown-field filter in from_backend_config).

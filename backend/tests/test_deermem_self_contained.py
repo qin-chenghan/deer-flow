@@ -24,6 +24,7 @@ from deerflow.agents.memory.backends.deermem.deermem.core.message_processing imp
     filter_messages_for_memory,
 )
 from deerflow.agents.memory.backends.deermem.deermem.core.storage import FileMemoryStorage
+from deerflow.agents.memory.backends.deermem.deermem.core.updater import _trim_facts_to_max
 
 
 @pytest.fixture
@@ -236,3 +237,104 @@ def test_per_user_memory_path_matches_host_safe_user_id(deermem_data_dir):
     # DeerMem used the host-identical safe_user_id (not some other encoding).
     user_dirs = [p.name for p in (deermem_data_dir / "users").iterdir() if p.is_dir()]
     assert user_dirs == [expected_safe], f"safe_user_id diverged from host: {user_dirs}"
+
+
+def test_trim_facts_to_max_coerces_non_float_confidence():
+    """Non-float stored confidence must not crash the max_facts trim sort.
+
+    Regression: the vendored copy used ``key=lambda f: f.get("confidence", 0)``
+    which raised TypeError comparing None/str against float once ``len > max_facts``
+    (legacy / imported facts with abnormal confidence). This is the #4034 intent
+    that the module-skipped test files never exercised against the vendored
+    updater; pinning it here so the rename can't silently drop the coercion again.
+    """
+    facts = [
+        {"id": "a", "confidence": None},
+        {"id": "b", "confidence": "0.9"},  # numeric string
+        {"id": "c", "confidence": 0.8},
+        {"id": "d", "confidence": "high"},  # non-numeric
+    ]
+    # No TypeError; coerced ranking: b("0.9"->0.9) > c(0.8) > a(None->0.5)=d("high"->0.5).
+    kept = _trim_facts_to_max(facts, max_facts=2)
+    assert [f["id"] for f in kept] == ["b", "c"]
+    # Below the cap -> returned unchanged (no sort, no crash).
+    assert _trim_facts_to_max(facts, max_facts=10) == facts
+
+
+def test_create_fact_trims_to_max_and_signals_eviction(deermem_data_dir):
+    """create_fact enforces max_facts and signals eviction via None fact_id.
+
+    Regression: the vendored ``create_memory_fact`` only appended (no trim), so
+    manual / tool adds could grow memory past max_facts. Now it trims (highest
+    confidence wins) and returns ``None`` when the cap evicts the new fact, so
+    the tool reports "not stored" instead of a dangling id + false "added".
+    """
+    # DeerMemConfig enforces max_facts >= 10, so fill the cap with 10 high-conf facts.
+    dm = DeerMem(backend_config={"max_facts": 10, "storage_path": str(deermem_data_dir)})
+    for i in range(10):
+        _, fid = dm.create_fact(f"high{i}", category="context", confidence=0.9, user_id="u1")
+        assert fid is not None
+
+    # Cap is full (10 facts); a lower-confidence 11th is evicted, not stored.
+    memory_data, evicted_id = dm.create_fact("low_evicted", category="context", confidence=0.1, user_id="u1")
+    assert evicted_id is None
+    assert "low_evicted" not in {f["content"] for f in memory_data["facts"]}
+    assert len(memory_data["facts"]) == 10
+
+
+def test_search_survives_non_float_confidence(deermem_data_dir):
+    """DeerMem.search ranks by _coerce_source_confidence, so non-float stored
+    confidence (null / string / non-numeric, reachable via import / legacy) must
+    not crash the sort. Re-adds the regression guard deleted with the monolithic
+    test_search_memory_facts_sort_survives_non_float_stored_confidence."""
+    dm = DeerMem(backend_config={"storage_path": str(deermem_data_dir)})
+    # create_fact validates confidence to float, so seed non-float via import
+    # (simulating imported / legacy data that bypasses _validate_confidence).
+    dm.import_memory(
+        {
+            "user": {},
+            "history": {},
+            "facts": [
+                {"id": "a", "content": "alpha matching query", "confidence": None},
+                {"id": "b", "content": "bravo matching query", "confidence": "0.9"},
+                {"id": "c", "content": "charlie matching query", "confidence": "high"},
+            ],
+        },
+        user_id="u1",
+    )
+    results = dm.search("query", top_k=10, user_id="u1")
+    # No TypeError; all three match "query"; ranked by coerced confidence desc:
+    # b("0.9"->0.9) > a(None->0.5)=c("high"->0.5), stable so a before c.
+    assert [r["id"] for r in results] == ["b", "a", "c"]
+
+
+def test_is_human_clarification_response_matches_host_read():
+    """The standalone mirror must agree with the host's read_human_input_response
+    so hidden-message filtering doesn't diverge between production (host hook) and
+    standalone / test (mirror default). Pins drift (#5)."""
+
+    from deerflow.agents.human_input import read_human_input_response
+    from deerflow.agents.memory.backends.deermem.deermem.core.message_processing import _is_human_clarification_response
+
+    def payload(**overrides):
+        base = {"version": 1, "kind": "human_input_response", "source": "s", "request_id": "r", "value": "v", "response_kind": "text"}
+        base.update(overrides)
+        return {"human_input_response": base}
+
+    cases = [
+        {},
+        {"human_input_response": {}},
+        payload(),  # valid text response
+        payload(response_kind="option", option_id="o1"),  # valid option response
+        payload(response_kind="option"),  # option without option_id -> not valid
+        payload(value=""),  # empty value -> not valid
+        payload(source=""),  # empty source -> not valid
+        payload(version=2),  # wrong version -> not valid
+        payload(kind="other"),  # wrong kind -> not valid
+        {"human_input_response": "not a mapping"},
+        {"other_key": 1},  # no human_input_response key
+    ]
+    for ak in cases:
+        host_keeps = read_human_input_response(ak) is not None
+        mirror_keeps = _is_human_clarification_response(ak)
+        assert host_keeps == mirror_keeps, f"divergence on {ak!r}: host={host_keeps} mirror={mirror_keeps}"

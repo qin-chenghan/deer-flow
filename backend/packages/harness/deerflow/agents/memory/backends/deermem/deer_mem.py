@@ -270,7 +270,7 @@ class DeerMem(MemoryManager):
         *,
         agent_name: str | None = None,
         user_id: str | None = None,
-    ) -> tuple[dict[str, Any], str]:
+    ) -> tuple[dict[str, Any], str | None]:
         return self._updater.create_memory_fact(
             content,
             category=category,

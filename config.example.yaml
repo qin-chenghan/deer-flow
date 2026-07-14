@@ -1448,7 +1448,7 @@ memory:
   # Backend-private config (a dict), passed verbatim to the backend __init__.
   # Each backend self-interprets it (DeerMem parses it into DeerMemConfig).
   backend_config:
-    storage_path: ""            # empty = deer-flow base_dir (factory injects absolute runtime_home); absolute path opts out of per-user isolation
+    storage_path: ""            # empty = deer-flow base_dir (factory injects absolute runtime_home); a non-empty path is the root DIRECTORY (per-user memory under {storage_path}/users/{uid}/memory.json)
     debounce_seconds: 30 # Wait time before processing queued updates
     model:                      # LLM for memory extraction; omit all fields = no extraction (non-LLM ops still work; an update raises)
       # provider: openai

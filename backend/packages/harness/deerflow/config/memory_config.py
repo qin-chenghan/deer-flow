@@ -133,8 +133,8 @@ def load_memory_config_from_dict(config_dict: dict) -> None:
             continue
         if key in _LEGACY_DEERMEM_FIELDS:
             value = config_dict.pop(key)
-            if value is None:
-                continue  # default value, no migration needed
+            if value is None or value == "":
+                continue  # default / empty value, no migration needed
             if key == "model_name":
                 # old top-level model_name -> backend_config.model.model
                 model_cfg = dict(backend_config.get("model") or {})
@@ -142,6 +142,24 @@ def load_memory_config_from_dict(config_dict: dict) -> None:
                     model_cfg["model"] = value
                     backend_config["model"] = model_cfg
                     migrated.append(f"{key} -> backend_config.model.model")
+            elif key == "storage_path" and str(value).endswith(".json"):
+                # Pre-abstraction storage_path was a FILE path (absolute = shared
+                # file opting out of per-user; a relative value like the old default
+                # "memory.json" was ignored for per-user). DeerMem now treats it as a
+                # root DIRECTORY. Carrying a file-style value verbatim would be
+                # resolved as a dir and either orphan per-user memory or hit
+                # NotADirectoryError on save. Drop it so the factory's zero-config
+                # runtime_home kicks in (per-user location unchanged:
+                # {base_dir}/users/{uid}/memory.json) and warn the operator.
+                logger.warning(
+                    "Legacy memory.storage_path=%r looks like a file path; DeerMem now "
+                    "treats storage_path as a root DIRECTORY (per-user memory under "
+                    "{storage_path}/users/{uid}/memory.json). Dropped -- memory now "
+                    "lands under the default root (runtime_home). Set "
+                    "memory.backend_config.storage_path to a directory if you want a "
+                    "custom location.",
+                    value,
+                )
             elif key not in backend_config:
                 # don't override an explicit backend_config value
                 backend_config[key] = value

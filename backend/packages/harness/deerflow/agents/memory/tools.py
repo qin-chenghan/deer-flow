@@ -137,6 +137,10 @@ def memory_add_tool(
             agent_name=agent_name,
             user_id=user_id,
         )
+        if fact_id is None:
+            # max_facts cap kept higher-confidence facts and evicted the new one;
+            # the fact was not stored -- report honestly instead of a dangling id.
+            return json.dumps({"error": "Fact was not stored because memory.max_facts kept higher-confidence facts"})
         return json.dumps({"fact_id": fact_id, "status": "added"})
     except ValueError as exc:
         return json.dumps({"error": str(exc)})

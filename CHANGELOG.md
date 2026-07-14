@@ -26,6 +26,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Custom `MemoryStorage` subclasses must accept `config` in `__init__` (was
   no-arg). A broken/old `storage_class` logs an error and falls back to
   `FileMemoryStorage` (won't crash) -- update the path + signature to restore it.
+- **memory:** `storage_path` semantics changed from a FILE path to a root
+  DIRECTORY. Pre-abstraction, an absolute `storage_path` was the shared memory
+  file (opting out of per-user isolation) and a relative value was the global
+  file under the data base_dir. Now `storage_path` (absolute or relative) is the
+  root directory; per-user memory lives at `{storage_path}/users/{uid}/memory.json`.
+  An upgrade keeping the old default `storage_path: memory.json` (a relative file
+  name) would orphan per-user memory or hit `NotADirectoryError` on save, so the
+  legacy migration **drops file-style `storage_path` values (ending in `.json`)
+  with a warning** and the factory **raises** if `storage_path` resolves to an
+  existing file. Set `memory.backend_config.storage_path` to a directory for a
+  custom root.
 
 ### Changed
 

@@ -243,7 +243,7 @@ async def create_memory_fact_endpoint(request: FactCreateRequest, http_request: 
     """Create a single fact manually."""
     try:
         create_fact = _require_capability("create_fact", label="create fact")
-        memory_data, _fact_id = create_fact(
+        memory_data, fact_id = create_fact(
             content=request.content,
             category=request.category,
             confidence=request.confidence,
@@ -254,6 +254,9 @@ async def create_memory_fact_endpoint(request: FactCreateRequest, http_request: 
     except OSError as exc:
         raise HTTPException(status_code=500, detail="Failed to create memory fact.") from exc
 
+    if fact_id is None:
+        # max_facts cap evicted the new (lower-confidence) fact; it was not stored.
+        raise HTTPException(status_code=409, detail="Fact was not stored because memory.max_facts kept higher-confidence facts")
     return MemoryResponse(**memory_data)
 
 
