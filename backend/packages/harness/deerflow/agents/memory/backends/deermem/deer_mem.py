@@ -372,7 +372,7 @@ class DeerMem(MemoryManager):
         agent_name: str | None = None,
         user_id: str | None = None,
     ) -> tuple[dict[str, Any], str | None]:
-        return self._updater.create_memory_fact(
+        result = self._updater.create_memory_fact(
             content,
             category=category,
             confidence=confidence,
@@ -380,7 +380,7 @@ class DeerMem(MemoryManager):
             user_id=user_id,
         )
         self._retrieval_dirty = True
-        return memory_data, fact_id
+        return result
 
     def delete_fact(
         self,
