@@ -114,7 +114,7 @@ def memory_add_tool(
     try:
         normalized_content = content.strip()
         if not normalized_content:
-            return json.dumps({"error": "content"})
+            return json.dumps({"error": "empty content"})
         content_key = _memory_content_key(normalized_content)
         manager = get_memory_manager()
         existing_facts = manager.get_memory(agent_name=agent_name, user_id=user_id).get("facts", [])
@@ -127,19 +127,16 @@ def memory_add_tool(
         create = getattr(manager, "create_fact", None)
         if not callable(create):
             return json.dumps({"error": f"memory backend {type(manager).__name__} does not support create_fact"})
-        updated_memory = create(
+        # create_fact returns (memory_data, fact_id) -- use the id directly rather
+        # than re-deriving it by content matching (which would couple the tool to
+        # the backend's content normalization and could misreport a storage cap).
+        _memory_data, fact_id = create(
             normalized_content,
             category=category,
             confidence=confidence,
             agent_name=agent_name,
             user_id=user_id,
         )
-        fact_id = next(
-            (fact.get("id") for fact in updated_memory.get("facts", []) if _memory_content_key(str(fact.get("content", ""))) == content_key),
-            None,
-        )
-        if fact_id is None:
-            return json.dumps({"error": "Fact was not stored because memory.max_facts kept higher-confidence facts"})
         return json.dumps({"fact_id": fact_id, "status": "added"})
     except ValueError as exc:
         return json.dumps({"error": str(exc)})

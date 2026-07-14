@@ -136,7 +136,7 @@ def test_create_memory_fact_route_returns_updated_memory() -> None:
     updated_memory = _sample_memory(facts=[{"id": "fact_new", "content": "User prefers concise code reviews.", "category": "preference", "confidence": 0.88, "createdAt": "2026-03-20T00:00:00Z", "source": "manual"}])
 
     mock_mgr = MagicMock()
-    mock_mgr.create_fact.return_value = updated_memory
+    mock_mgr.create_fact.return_value = (updated_memory, "fact_new")
     with patch("app.gateway.routers.memory.get_memory_manager", return_value=mock_mgr):
         with TestClient(app) as client:
             response = client.post("/api/memory/facts", json={"content": "User prefers concise code reviews.", "category": "preference", "confidence": 0.88})

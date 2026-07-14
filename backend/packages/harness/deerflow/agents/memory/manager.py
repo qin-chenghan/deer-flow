@@ -394,6 +394,14 @@ def get_memory_manager() -> MemoryManager:
             from deerflow.config.runtime_paths import runtime_home
 
             backend_config["storage_path"] = str(runtime_home())
+        elif not Path(backend_config.get("storage_path", "")).is_absolute():
+            # A relative storage_path is resolved against runtime_home() (base_dir-
+            # relative, CWD-independent) to preserve pre-abstraction semantics; left
+            # as-is it would be CWD-relative and fragile. (Resolved here in host code
+            # so the portable paths.py stays free of any runtime_home dependency.)
+            from deerflow.config.runtime_paths import runtime_home
+
+            backend_config["storage_path"] = str((Path(runtime_home()) / backend_config["storage_path"]).resolve())
         # Host-default hooks: callables cannot come from YAML, so the host
         # injects them here. DeerMem consumes them (known config fields);
         # noop ignores them (unknown-field filter in from_backend_config).

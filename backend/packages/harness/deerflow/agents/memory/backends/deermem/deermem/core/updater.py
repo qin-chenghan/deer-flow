@@ -515,8 +515,14 @@ class MemoryUpdater:
             raise OSError("Failed to save cleared memory data")
         return cleared_memory
 
-    def create_memory_fact(self, content: str, category: str = "context", confidence: float = 0.5, agent_name: str | None = None, *, user_id: str | None = None) -> dict[str, Any]:
-        """Create a new fact and persist the updated memory data."""
+    def create_memory_fact(self, content: str, category: str = "context", confidence: float = 0.5, agent_name: str | None = None, *, user_id: str | None = None) -> tuple[dict[str, Any], str]:
+        """Create a new fact, persist it, and return ``(updated_memory, fact_id)``.
+
+        The fact_id is returned directly so callers (e.g. the memory_add tool)
+        don't have to re-derive it from the memory data by content matching --
+        which would couple them to the backend's content normalization and could
+        misreport a storage cap on backends that normalize differently.
+        """
         normalized_content = content.strip()
         if not normalized_content:
             raise ValueError("content")
@@ -526,9 +532,10 @@ class MemoryUpdater:
         memory_data = self.get_memory_data(agent_name, user_id=user_id)
         updated_memory = dict(memory_data)
         facts = list(memory_data.get("facts", []))
+        fact_id = f"fact_{uuid.uuid4().hex[:8]}"
         facts.append(
             {
-                "id": f"fact_{uuid.uuid4().hex[:8]}",
+                "id": fact_id,
                 "content": normalized_content,
                 "category": normalized_category,
                 "confidence": validated_confidence,
@@ -539,7 +546,7 @@ class MemoryUpdater:
         updated_memory["facts"] = facts
         if not self._save_memory_to_file(updated_memory, agent_name, user_id=user_id):
             raise OSError("Failed to save memory data after creating fact")
-        return updated_memory
+        return updated_memory, fact_id
 
     def delete_memory_fact(self, fact_id: str, agent_name: str | None = None, *, user_id: str | None = None) -> dict[str, Any]:
         """Delete a fact by its id and persist the updated memory data."""

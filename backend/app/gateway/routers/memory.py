@@ -208,6 +208,9 @@ async def reload_memory(http_request: Request) -> MemoryResponse:
         memory_data = manager.reload_memory(user_id=user_id)
     else:
         # Non-DeerMem backends have no reload concept; return current memory.
+        # (Asymmetry vs fact CRUD, which raises 501 when unsupported: reload is a
+        # read-only refresh, so degrading to get_memory is safe and still useful;
+        # silently no-op'ing a write would hide data loss, so writes fail loud.)
         memory_data = manager.get_memory(user_id=user_id)
     return MemoryResponse(**memory_data)
 
@@ -240,7 +243,7 @@ async def create_memory_fact_endpoint(request: FactCreateRequest, http_request: 
     """Create a single fact manually."""
     try:
         create_fact = _require_capability("create_fact", label="create fact")
-        memory_data = create_fact(
+        memory_data, _fact_id = create_fact(
             content=request.content,
             category=request.category,
             confidence=request.confidence,

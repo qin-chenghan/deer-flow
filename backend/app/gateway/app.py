@@ -192,8 +192,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Pre-warm tiktoken encoding cache so the first memory-injection request
     # never blocks on the BPE data download (which hits an OpenAI/Azure URL
     # that may be unreachable in restricted networks — see issue #3402).
-    # When memory.token_counting is "char", token counting never touches
-    # tiktoken, so skip the warm-up entirely (avoids even the 5s probe in
+    # Warm-up runs via the manager's `warm` capability (getattr-probed, so
+    # non-DeerMem backends skip it). DeerMem.warm re-checks token_counting==
+    # "char" and returns early, so char-mode backends never touch tiktoken
+    # (avoids even the 5s probe in
     # network-restricted deployments — see issue #3429).
     try:
         from deerflow.agents.memory import get_memory_manager

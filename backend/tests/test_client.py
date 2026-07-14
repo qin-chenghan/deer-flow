@@ -1552,7 +1552,7 @@ class TestMemoryManagement:
     def test_create_memory_fact(self, client):
         data = {"version": "1.0", "facts": []}
         mock_mgr = MagicMock()
-        mock_mgr.create_fact.return_value = data
+        mock_mgr.create_fact.return_value = (data, "fact_new")
         with patch("deerflow.agents.memory.get_memory_manager", return_value=mock_mgr):
             result = client.create_memory_fact(
                 "User prefers concise code reviews.",

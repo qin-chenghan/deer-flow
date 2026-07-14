@@ -210,3 +210,29 @@ def test_portability_vendor_to_other_agent(tmp_path, monkeypatch):
     finally:
         for k in [k for k in list(sys.modules) if k.startswith("otheragent_deermem") or k == "otheragent"]:
             sys.modules.pop(k, None)
+
+
+def test_per_user_memory_path_matches_host_safe_user_id(deermem_data_dir):
+    """Pin the per-user memory path across the abstraction.
+
+    DeerMem writes memory to ``{storage_path}/users/{safe_user_id}/memory.json``
+    where ``safe_user_id`` is byte-identical to the host's ``make_safe_user_id``.
+    The factory injects ``runtime_home()`` (= base_dir) as ``storage_path``, so
+    the on-disk path is ``{base_dir}/users/{uid}/memory.json`` -- identical to
+    pre-abstraction. This locks that equivalence so a future change to DeerMem's
+    path / safe_user_id logic can't silently orphan existing per-user memory
+    (risk:high, persistent state).
+    """
+    from deerflow.config.paths import make_safe_user_id
+
+    user_id = "test-user-123@example.com"
+    # storage_path mirrors what the host factory injects (runtime_home / base_dir)
+    dm = DeerMem(backend_config={"storage_path": str(deermem_data_dir)})
+    dm.create_fact("User prefers concise answers", category="preference", user_id=user_id)
+
+    expected_safe = make_safe_user_id(user_id)
+    expected_file = deermem_data_dir / "users" / expected_safe / "memory.json"
+    assert expected_file.is_file(), f"memory not at expected per-user path: {expected_file}"
+    # DeerMem used the host-identical safe_user_id (not some other encoding).
+    user_dirs = [p.name for p in (deermem_data_dir / "users").iterdir() if p.is_dir()]
+    assert user_dirs == [expected_safe], f"safe_user_id diverged from host: {user_dirs}"

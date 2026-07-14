@@ -9,9 +9,44 @@ makes backends swappable and portable (DeerMem's knobs do not leak onto the
 shared contract).
 """
 
+import logging
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
+
+# Host-shared MemoryConfig fields (read by every backend / call site / factory).
+_SHARED_FIELDS = frozenset({"enabled", "mode", "injection_enabled", "manager_class", "backend_config"})
+
+# DeerMem-private fields that used to live at the top level of `memory:` in
+# config.yaml (pre-abstraction). On load they are auto-migrated into
+# `backend_config` so an upgrade does NOT silently revert customized settings
+# to defaults. `model_name` maps to `backend_config.model.model` (the new nested
+# model sub-config); the rest are 1:1.
+_LEGACY_DEERMEM_FIELDS = frozenset(
+    {
+        "storage_path",
+        "storage_class",
+        "debounce_seconds",
+        "max_facts",
+        "fact_confidence_threshold",
+        "max_injection_tokens",
+        "token_counting",
+        "guaranteed_categories",
+        "guaranteed_token_budget",
+        "staleness_review_enabled",
+        "staleness_age_days",
+        "staleness_min_candidates",
+        "staleness_max_removals_per_cycle",
+        "staleness_protected_categories",
+        "consolidation_enabled",
+        "consolidation_min_facts",
+        "consolidation_max_groups_per_cycle",
+        "consolidation_max_sources",
+        "model_name",
+    }
+)
 
 
 class MemoryConfig(BaseModel):
@@ -79,8 +114,48 @@ def set_memory_config(config: MemoryConfig) -> None:
 def load_memory_config_from_dict(config_dict: dict) -> None:
     """Load memory configuration from a dictionary.
 
-    DeerMem-private keys (from a not-yet-migrated config) are ignored -- they
-    must live under ``backend_config`` to reach the backend.
+    Host-shared fields (``enabled`` / ``mode`` / ``injection_enabled`` /
+    ``manager_class`` / ``backend_config``) are read directly. DeerMem-private
+    fields that used to live at the top level of ``memory:`` in config.yaml
+    (pre-abstraction: ``storage_path``, ``max_facts``, ``debounce_seconds``,
+    ``model_name``, ``token_counting``, ``staleness_*``, ``consolidation_*``,
+    ...) are **auto-migrated into ``backend_config``** with a warning, so an
+    upgrade from a pre-abstraction config does NOT silently revert customized
+    settings to defaults. Unknown top-level keys (likely typos) are warned and
+    ignored.
     """
     global _memory_config
+    config_dict = dict(config_dict or {})
+    backend_config = dict(config_dict.get("backend_config") or {})
+    migrated: list[str] = []
+    for key in list(config_dict.keys()):
+        if key in _SHARED_FIELDS:
+            continue
+        if key in _LEGACY_DEERMEM_FIELDS:
+            value = config_dict.pop(key)
+            if value is None:
+                continue  # default value, no migration needed
+            if key == "model_name":
+                # old top-level model_name -> backend_config.model.model
+                model_cfg = dict(backend_config.get("model") or {})
+                if "model" not in model_cfg:
+                    model_cfg["model"] = value
+                    backend_config["model"] = model_cfg
+                    migrated.append(f"{key} -> backend_config.model.model")
+            elif key not in backend_config:
+                # don't override an explicit backend_config value
+                backend_config[key] = value
+                migrated.append(f"{key} -> backend_config.{key}")
+        else:
+            logger.warning(
+                "Unknown memory config key %r at top level (not a shared field %s nor a known legacy DeerMem field); ignored.",
+                key,
+                sorted(_SHARED_FIELDS),
+            )
+    if migrated:
+        logger.warning(
+            "Migrated legacy top-level memory fields into backend_config; move them under memory.backend_config in config.yaml to silence this: %s",
+            ", ".join(migrated),
+        )
+    config_dict["backend_config"] = backend_config
     _memory_config = MemoryConfig(**config_dict)

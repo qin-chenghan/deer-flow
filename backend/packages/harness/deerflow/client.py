@@ -1289,7 +1289,8 @@ class DeerFlowClient:
         manager = get_memory_manager()
         if not hasattr(manager, "create_fact"):
             raise NotImplementedError(f"create_fact not supported by memory backend '{type(manager).__name__}'")
-        return manager.create_fact(content=content, category=category, confidence=confidence, user_id=get_effective_user_id())
+        memory_data, _fact_id = manager.create_fact(content=content, category=category, confidence=confidence, user_id=get_effective_user_id())
+        return memory_data
 
     def delete_memory_fact(self, fact_id: str) -> dict:
         """Delete a single fact from memory by fact id."""

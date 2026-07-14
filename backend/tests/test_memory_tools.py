@@ -72,12 +72,13 @@ class _MockManager:
         self.calls.append(("create_fact", content, category, confidence, agent_name, user_id))
         if self._raise_on_create:
             raise self._raise_on_create
-        # Returned memory dict contains the created fact (content normalized by the tool).
+        # Mirrors the real backend: returns (memory_data, fact_id) so the tool uses
+        # the id directly instead of re-deriving it by content matching.
         created = dict(self._created_fact)
         created["content"] = content
         created["category"] = category
         created["confidence"] = confidence
-        return {"facts": [created] + list(self._facts)}
+        return {"facts": [created] + list(self._facts)}, created.get("id")
 
     def update_fact(self, fact_id, content=None, category=None, confidence=None, *, agent_name=None, user_id=None):
         self.calls.append(("update_fact", fact_id, content, category, confidence, agent_name, user_id))
@@ -198,12 +199,13 @@ class TestMemoryAddTool:
         assert any(c[0] == "create_fact" and c[1] == "User prefers dark mode" for c in mgr.calls)
 
     def test_add_returns_fact_id_when_storage_reorders_facts(self, monkeypatch):
-        """fact_id is found by content key, not by position in the returned list."""
+        """fact_id comes directly from create_fact, not derived from the returned list."""
         created = {"id": "fact_new123", "content": "User prefers dark mode"}
         older = {"id": "fact_old999", "content": "Older fact"}
-        # create_fact returns the created fact first; tool must still match by content.
+        # Storage may reorder facts; create_fact returns the id directly so the
+        # tool doesn't depend on list position or content matching.
         mgr = _MockManager(facts=[], created_fact=created)
-        mgr.create_fact = lambda content, category="context", confidence=0.5, *, agent_name=None, user_id=None: {"facts": [created, older]}
+        mgr.create_fact = lambda content, category="context", confidence=0.5, *, agent_name=None, user_id=None: ({"facts": [created, older]}, "fact_new123")
         _install_manager(monkeypatch, mgr)
 
         result_json = memory_add_tool.func(SimpleNamespace(context={}), "User prefers dark mode")
