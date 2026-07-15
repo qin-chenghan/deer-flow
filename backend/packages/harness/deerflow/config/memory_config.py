@@ -102,6 +102,14 @@ _memory_config: MemoryConfig = MemoryConfig()
 
 def get_memory_config() -> MemoryConfig:
     """Get the current memory configuration."""
+    # Ensure AppConfig signature is fresh before returning _memory_config.
+    # get_app_config() auto-reloads on file change and calls
+    # load_memory_config_from_dict() during _apply_singleton_configs(),
+    # so this side effect keeps _memory_config in sync.
+    # Local import to avoid circular dependency (app_config -> memory_config).
+    from deerflow.config.app_config import get_app_config as _get_app_config
+
+    _get_app_config()
     return _memory_config
 
 

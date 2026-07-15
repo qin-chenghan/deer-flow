@@ -57,9 +57,17 @@ export function ClipboardSafeStreamdown({
   children,
   ...props
 }: ClipboardSafeStreamdownProps) {
+  // Strip system-level memory tags (<memory>, </memory>) that would cause
+  // React to log "unrecognized tag" console errors when the markdown
+  // renderer passes them through as raw HTML.
+  const sanitizedChildren =
+    typeof children === "string"
+      ? children.replace(/<\/?memory>/g, "")
+      : children;
+
   return (
-    <StreamdownFallbackBoundary raw={children}>
-      <Streamdown {...props}>{children}</Streamdown>
+    <StreamdownFallbackBoundary raw={sanitizedChildren}>
+      <Streamdown {...props}>{sanitizedChildren}</Streamdown>
     </StreamdownFallbackBoundary>
   );
 }
