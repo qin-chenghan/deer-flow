@@ -16,6 +16,7 @@ import logging
 import math
 import re
 import sqlite3
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -97,7 +98,18 @@ class FTS5Retrieval:
 
     def __init__(self, db_path: str | Path = ":memory:"):
         self._db_path = str(db_path)
-        self._conn = sqlite3.connect(self._db_path)
+        # Gateway runs tool calls via asyncio.to_thread / ThreadPoolExecutor;
+        # SQLite connections are not safe to share across threads even when the
+        # top-level instance is single-process. We pick two defensive layers:
+        #   1. ``check_same_thread=False`` so a connection created in thread A
+        #      is accessible from thread B (libsqlite itself is reentrant under
+        #      a serialised wrapper, see #4208 hot-path discussion).
+        #   2. ``_lock`` guards all mutating sqlite calls so concurrent callers
+        #      serialise through here (prevents interleaved writes / FTS5 index
+        #      reorderings). Callers from outside instance methods MUST enter
+        #      the lock via the public API and not bypass into ``self._conn``.
+        self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
+        self._lock = threading.Lock()
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._init_schema()
 
@@ -141,32 +153,35 @@ class FTS5Retrieval:
         scope_agent: str | None = None,
     ) -> None:
         """Insert or update a fact in the FTS5 index."""
-        now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
-        indexed_content = self._preprocess_content(content)
+        with self._lock:
+            now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+            indexed_content = self._preprocess_content(content)
 
-        conn = self._conn
-        # Delete existing entry with same doc_id (INSERT OR REPLACE for FTS5)
-        conn.execute("DELETE FROM memory_fts WHERE doc_id = ?", (fact_id,))
-        conn.execute(
-            """
-            INSERT INTO memory_fts(doc_id, content, category, scope_user, scope_agent, created_at, confidence)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (fact_id, indexed_content, category, scope_user or "", scope_agent or "", created_at or now, confidence),
-        )
-        conn.commit()
+            conn = self._conn
+            # Delete existing entry with same doc_id (INSERT OR REPLACE for FTS5)
+            conn.execute("DELETE FROM memory_fts WHERE doc_id = ?", (fact_id,))
+            conn.execute(
+                """
+                INSERT INTO memory_fts(doc_id, content, category, scope_user, scope_agent, created_at, confidence)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (fact_id, indexed_content, category, scope_user or "", scope_agent or "", created_at or now, confidence),
+            )
+            conn.commit()
 
     def remove_fact(self, fact_id: str) -> None:
         """Remove a fact from the FTS5 index."""
-        conn = self._conn
-        conn.execute("DELETE FROM memory_fts WHERE doc_id = ?", (fact_id,))
-        conn.commit()
+        with self._lock:
+            conn = self._conn
+            conn.execute("DELETE FROM memory_fts WHERE doc_id = ?", (fact_id,))
+            conn.commit()
 
     def clear_index(self) -> None:
         """Clear the entire FTS5 index."""
-        conn = self._conn
-        conn.execute("DELETE FROM memory_fts")
-        conn.commit()
+        with self._lock:
+            conn = self._conn
+            conn.execute("DELETE FROM memory_fts")
+            conn.commit()
 
     def rebuild_from_facts(
         self,
@@ -208,7 +223,11 @@ class FTS5Retrieval:
         Returns list of fact dicts (id, content, category, confidence,
         createdAt, source, score, bm25_score) sorted by relevance.
         """
+        import time
+
+        _t0 = time.perf_counter()
         if not query or not query.strip() or top_k <= 0:
+            logger.debug("FTS5Retrieval.search: skipped (empty/invalid) query=%r top_k=%d", query, top_k)
             return []
 
         query = query.strip()
@@ -220,20 +239,46 @@ class FTS5Retrieval:
         else:
             fts5_query = _build_fallback_query(query)
             strategy = "tokenized"
+        logger.debug(
+            "FTS5Retrieval.search: query=%r strategy=%r fts5_query=%r scope_user=%r scope_agent=%r category=%r top_k=%d",
+            query,
+            strategy,
+            fts5_query,
+            scope_user,
+            scope_agent,
+            category,
+            top_k,
+        )
 
         # Try search
         results = self._execute_search(fts5_query, scope_user, scope_agent, category, top_k)
         if results is not None:
+            logger.debug(
+                "FTS5Retrieval.search: strategy=%r returned %d results in %.1fms",
+                strategy,
+                len(results),
+                (time.perf_counter() - _t0) * 1000,
+            )
             return results
 
         # Fallback: advanced syntax error -> tokenized OR
         if strategy == "advanced":
             fallback = _build_fallback_query(query)
             if fallback and fallback != fts5_query:
+                logger.debug("FTS5Retrieval.search: advanced syntax failed, retrying with tokenized fts5_query=%r", fallback)
                 results = self._execute_search(fallback, scope_user, scope_agent, category, top_k)
                 if results is not None:
+                    logger.debug(
+                        "FTS5Retrieval.search: tokenized fallback returned %d results in %.1fms",
+                        len(results),
+                        (time.perf_counter() - _t0) * 1000,
+                    )
                     return results
 
+        logger.debug(
+            "FTS5Retrieval.search: returning [] (no path produced results) in %.1fms",
+            (time.perf_counter() - _t0) * 1000,
+        )
         return []
 
     def _execute_search(
@@ -274,12 +319,13 @@ class FTS5Retrieval:
         """
         params.append(top_k * 2)
 
-        try:
-            conn = self._conn
-            rows = conn.execute(sql, params).fetchall()
-        except sqlite3.OperationalError as e:
-            logger.debug("FTS5 query syntax error: %s (query: %s)", e, fts5_query)
-            return None
+        with self._lock:
+            try:
+                conn = self._conn
+                rows = conn.execute(sql, params).fetchall()
+            except sqlite3.OperationalError as e:
+                logger.debug("FTS5 query syntax error: %s (query: %s)", e, fts5_query)
+                return None
 
         results: list[dict[str, Any]] = []
         for row in rows:
@@ -313,6 +359,16 @@ class FTS5Retrieval:
                 }
             )
 
+        logger.debug(
+            "FTS5 raw SQL: fts5_query=%r scope_user=%r scope_agent=%r category=%r -> %d rows. bm25 raw: %s",
+            fts5_query,
+            scope_user,
+            scope_agent,
+            category,
+            len(rows),
+            [(r["id"], r["bm25_score"]) for r in results[:10]],
+        )
+
         results.sort(key=lambda r: r["score"], reverse=True)
         return results[:top_k]
 
@@ -336,18 +392,28 @@ class FTS5Retrieval:
             time_decay = 1.0 if age_days < 30 else math.exp(-0.01 * (age_days - 30))
             score *= time_decay
         except (ValueError, TypeError):
-            pass
+            time_decay = -1.0  # sentinel for "unparseable" → skipped decay
+            age_days = -1
 
         score += confidence * _CONFIDENCE_WEIGHT
 
+        logger.debug(
+            "_compute_final_score: bm25_in=%.4f time_decay=%s age_days=%s conf=%.2f -> final=%.4f",
+            bm25_score,
+            time_decay,
+            age_days,
+            confidence,
+            score,
+        )
         return score
 
     # ── Stats ──────────────────────────────────────────────────────────
 
     def stats(self) -> dict[str, Any]:
         """Index statistics."""
-        conn = self._conn
-        total = conn.execute("SELECT COUNT(*) FROM memory_fts").fetchone()[0]
+        with self._lock:
+            conn = self._conn
+            total = conn.execute("SELECT COUNT(*) FROM memory_fts").fetchone()[0]
         return {
             "total_docs": total,
             "jieba": _jieba_available,
@@ -355,4 +421,5 @@ class FTS5Retrieval:
         }
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()

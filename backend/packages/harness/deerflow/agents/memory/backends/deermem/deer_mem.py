@@ -212,26 +212,56 @@ class DeerMem(MemoryManager):
         search is not starved by higher-confidence facts in other categories.
         """
         if not query or not query.strip() or top_k <= 0:
+            logger.debug("search: skipped (empty query or invalid top_k): query=%r top_k=%d", query, top_k)
             return []
+
+        logger.debug("search entry: query=%r top_k=%d user=%r agent=%r category=%r", query, top_k, user_id, agent_name, category)
 
         # Try FTS5 retrieval first
         results = self._fts5_search(query, top_k=top_k, user_id=user_id, agent_name=agent_name, category=category)
         if results:
+            logger.debug("search exit: returning %d FTS5 results (no fallback needed)", len(results))
             return results
 
         # Fallback: case-insensitive substring search
-        return self._substring_search(query, top_k=top_k, user_id=user_id, agent_name=agent_name, category=category)
+        fallback_result = self._substring_search(query, top_k=top_k, user_id=user_id, agent_name=agent_name, category=category)
+        logger.debug(
+            "search exit: FTS5 returned 0, fell back to substring search -> %d results",
+            len(fallback_result),
+        )
+        return fallback_result
 
     def _ensure_retrieval_index(self, user_id: str | None, agent_name: str | None) -> FTS5Retrieval | None:
         """Lazily build/rebuild the FTS5 index from current facts."""
-        if self._retrieval is None:
+        import time
+
+        _t0 = time.perf_counter()
+        is_new_instance = self._retrieval is None
+        if is_new_instance:
             self._retrieval = FTS5Retrieval(":memory:")
             self._retrieval_dirty = True
+            logger.debug("FTS5 index: created new FTS5Retrieval instance (id=%s)", id(self._retrieval))
         if self._retrieval_dirty:
             memory_data = self._updater.get_memory_data(agent_name=agent_name, user_id=user_id)
             facts = memory_data.get("facts", [])
+            cache_info = memory_data.get("_cache_debug", {}) if isinstance(memory_data, dict) else {}
+            logger.debug(
+                "FTS5 index: dirty=True, rebuilding from %d facts (user=%r agent=%r, storage cache mtime=%s)",
+                len(facts),
+                user_id,
+                agent_name,
+                cache_info,
+            )
             self._retrieval.rebuild_from_facts(facts, scope_user=user_id, scope_agent=agent_name)
             self._retrieval_dirty = False
+        else:
+            logger.debug(
+                "FTS5 index: dirty=False, reusing (instance_id=%s, user=%r agent=%r)",
+                id(self._retrieval),
+                user_id,
+                agent_name,
+            )
+        logger.debug("FTS5 index: ensure took %.3fms", (time.perf_counter() - _t0) * 1000)
         return self._retrieval
 
     def _fts5_search(
@@ -244,19 +274,43 @@ class DeerMem(MemoryManager):
         category: str | None,
     ) -> list[dict[str, Any]]:
         """FTS5 BM25 search. Returns empty list on any failure."""
+        import time
+
+        _t0 = time.perf_counter()
         try:
             retrieval = self._ensure_retrieval_index(user_id, agent_name)
             if retrieval is None:
+                logger.debug("FTS5 search: ensure returned None, skipping (user=%r)", user_id)
                 return []
-            return retrieval.search(
+            results = retrieval.search(
                 query,
                 scope_user=user_id,
                 scope_agent=agent_name,
                 category=category,
                 top_k=top_k,
             )
+            elapsed_ms = (time.perf_counter() - _t0) * 1000
+
+            def _safe_float(c: object, prec: int) -> str:
+                try:
+                    return f"{float(c):.{prec}f}"
+                except (TypeError, ValueError):
+                    return repr(c)
+
+            top_preview = [f"[{r['id']}] bm25={_safe_float(r.get('bm25_score', 0), 3)} conf={_safe_float(r.get('confidence', 0), 2)} src={r.get('source', '?')} content={r['content'][:40]!r}" for r in results[:5]]
+            logger.debug(
+                "FTS5 search: query=%r user=%r agent=%r category=%r -> %d results in %.1fms. Top: %s",
+                query,
+                user_id,
+                agent_name,
+                category,
+                len(results),
+                elapsed_ms,
+                top_preview or "(none)",
+            )
+            return results
         except Exception:
-            logger.debug("FTS5 search failed, falling back to substring", exc_info=True)
+            logger.debug("FTS5 search failed for query=%r user=%r, falling back to substring", query, user_id, exc_info=True)
             return []
 
     def _substring_search(
@@ -269,11 +323,35 @@ class DeerMem(MemoryManager):
         category: str | None,
     ) -> list[dict[str, Any]]:
         """Case-insensitive substring search (original implementation)."""
+        import time
+
+        _t0 = time.perf_counter()
         query_lower = query.strip().lower()
         memory_data = self._updater.get_memory_data(agent_name=agent_name, user_id=user_id)
-        matched = [fact for fact in memory_data.get("facts", []) if isinstance(fact.get("content"), str) and query_lower in fact["content"].lower() and (category is None or fact.get("category") == category)]
+        all_facts = memory_data.get("facts", [])
+        matched = [fact for fact in all_facts if isinstance(fact.get("content"), str) and query_lower in fact["content"].lower() and (category is None or fact.get("category") == category)]
         matched.sort(key=_coerce_source_confidence, reverse=True)
-        return matched[:top_k]
+        result = matched[:top_k]
+        elapsed_ms = (time.perf_counter() - _t0) * 1000
+
+        def _safe_conf(c: object) -> str:
+            try:
+                return f"{float(c):.2f}"
+            except (TypeError, ValueError):
+                return repr(c)
+
+        top_preview = [f"[{r['id']}] conf={_safe_conf(r.get('confidence', 0))} content={r['content'][:40]!r}" for r in result[:5]]
+        logger.debug(
+            "Substring search: query_lower=%r user=%r -> scanned %d facts, %d matched, returned %d in %.1fms. Top: %s",
+            query_lower,
+            user_id,
+            len(all_facts),
+            len(matched),
+            len(result),
+            elapsed_ms,
+            top_preview or "(none)",
+        )
+        return result
 
     # ── Manage ───────────────────────────────────────────────────────────
     def get_memory(

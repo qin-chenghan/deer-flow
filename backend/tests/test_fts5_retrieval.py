@@ -430,3 +430,44 @@ class TestEngineLifecycle:
         # fixture already yielded engine; closing twice should be safe-ish
         engine.close()
         # re-closing should not crash (SQLite3 raises ProgrammingError but we don't assert)
+
+
+class TestThreadSafety:
+    """Regression for #4208 hot-path: engine used by gateway tool pool.
+
+    ``sqlite3.connect(":memory:")`` raises ``ProgrammingError`` when a
+    connection is touched from a thread other than the one that created
+    it.  ``FTS5Retrieval`` must be safe to use across threads (gateway
+    ``asyncio.to_thread`` / ``ContextThreadPoolExecutor``).
+    """
+
+    def test_search_from_multiple_threads_concurrently(self):
+        """Spawn N threads that hit the engine while a writer rebuilds.
+
+        Without the lock/check_same_thread=False pair this hits the
+        'SQLite objects created in a thread can only be used in that
+        same thread' guard.  With the fix it must complete cleanly.
+        """
+        import threading
+
+        eng = FTS5Retrieval(":memory:")
+        eng.rebuild_from_facts(FIXTURE_FACTS, scope_user="u")
+        try:
+            errors: list[BaseException] = []
+            barrier = threading.Barrier(8)
+
+            def worker() -> None:
+                try:
+                    barrier.wait(timeout=5)
+                    eng.search("kubernetes", scope_user="u", top_k=5)
+                except BaseException as e:  # pragma: no cover -- captured for re-raise
+                    errors.append(e)
+
+            threads = [threading.Thread(target=worker) for _ in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=5)
+            assert not errors, f"thread-safety regression: {errors}"
+        finally:
+            eng.close()
