@@ -75,12 +75,14 @@ class TestUserIsolatedStorage:
         assert s.load(user_id="alice")["user"]["workContext"]["summary"] == "alice"
 
     def test_user_agent_memory_file_location(self, base_dir: Path):
-        """Per-user per-agent memory uses {root}/users/{uid}/agents/{name}/memory.json."""
+        """One user JSON stores summaries; agent facts live below the agent directory."""
         s = FileMemoryStorage(DeerMemConfig())
         memory = create_empty_memory()
-        memory["user"]["workContext"]["summary"] = "agent scoped"
+        memory["facts"] = [{"id": "fact_agent", "content": "agent scoped"}]
         s.save(memory, "test-agent", user_id="alice")
-        assert (base_dir / "users" / "alice" / "agents" / "test-agent" / "memory.json").exists()
+        assert (base_dir / "users" / "alice" / "memory.json").exists()
+        assert not (base_dir / "users" / "alice" / "agents" / "test-agent" / "memory.json").exists()
+        assert (base_dir / "users" / "alice" / "agents" / "test-agent" / "facts" / "fa" / "fact_agent.md").exists()
 
     def test_cache_key_is_user_agent_tuple(self, base_dir: Path):
         """Cache keys must be (user_id, agent_name) tuples."""

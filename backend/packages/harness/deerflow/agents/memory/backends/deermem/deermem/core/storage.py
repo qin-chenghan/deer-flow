@@ -1,7 +1,8 @@
 """Memory storage providers.
 
-The file backend stores summaries and a fact manifest in ``memory.json`` while
-each fact is canonical in one Markdown file with YAML front matter.  The
+The file backend stores only project-independent user/history summaries in one
+user-level ``memory.json``. Each fact is canonical in one Markdown file below
+its required agent name. The
 public ``load``/``save`` compatibility surface still exposes the historical
 document shape (``facts`` is a list), so updater and gateway callers can move
 to the fact repository API incrementally.
@@ -30,7 +31,7 @@ from typing import Any, Protocol
 import yaml
 
 from ..config import DeerMemConfig
-from .paths import fact_file_path, memory_file_path
+from .paths import agent_facts_directory, fact_file_path, memory_file_path
 
 logger = logging.getLogger(__name__)
 
@@ -43,11 +44,11 @@ class MemoryStorageError(RuntimeError):
 
 
 class MemoryStorageCorruption(MemoryStorageError):
-    """The persisted manifest or a canonical fact cannot be parsed safely."""
+    """The global memory JSON or a canonical fact cannot be parsed safely."""
 
 
 class MemoryRevisionConflict(MemoryStorageError):
-    """A stale writer attempted to overwrite a newer manifest revision."""
+    """A stale writer attempted to overwrite a newer user-memory revision."""
 
 
 class RetrievalPort(Protocol):
@@ -275,7 +276,7 @@ class FileMemoryStorage(MemoryStorage):
     def __init__(self, config: DeerMemConfig, retrieval: RetrievalPort | None = None):
         self._config = config
         self._retrieval = retrieval
-        self._memory_cache: dict[tuple[str | None, str | None], tuple[dict[str, Any], tuple[int, int] | None]] = {}
+        self._memory_cache: dict[tuple[str | None, str | None], tuple[dict[str, Any], tuple[Any, ...]]] = {}
         self._cache_lock = threading.Lock()
         self._scope_locks: dict[tuple[str | None, str | None], threading.RLock] = {}
 
@@ -290,15 +291,71 @@ class FileMemoryStorage(MemoryStorage):
     def _get_memory_file_path(self, agent_name: str | None = None, *, user_id: str | None = None) -> Path:
         return memory_file_path(self._config, agent_name, user_id=user_id)
 
-    def _load_manifest(self, path: Path) -> dict[str, Any] | None:
+    def _scope_signature(self, path: Path, agent_name: str | None) -> tuple[Any, ...]:
+        """Track the global summary file plus the selected agent's fact files."""
+        signature: list[Any] = [_file_signature(path)]
+        if agent_name is not None:
+            fact_root = agent_facts_directory(path, agent_name)
+            for fact_path in sorted(fact_root.glob("**/*.md")):
+                file_signature = _file_signature(fact_path)
+                if file_signature is not None:
+                    signature.append((fact_path.as_posix(), *file_signature))
+        return tuple(signature)
+
+    def _load_agent_facts(self, path: Path, agent_name: str | None) -> list[dict[str, Any]]:
+        if agent_name is None:
+            return []
+        facts: list[dict[str, Any]] = []
+        for fact_path in sorted(agent_facts_directory(path, agent_name).glob("**/*.md")):
+            fact = _parse_fact_markdown(fact_path)
+            if str(fact.get("id")) != fact_path.stem:
+                raise MemoryStorageCorruption(f"Fact id mismatch for {fact_path}")
+            facts.append(fact)
+        return facts
+
+    def _agent_entries(self, path: Path, agent_name: str | None) -> dict[str, dict[str, str]]:
+        if agent_name is None:
+            return {}
+        entries: dict[str, dict[str, str]] = {}
+        for fact_path in sorted(agent_facts_directory(path, agent_name).glob("**/*.md")):
+            fact = _parse_fact_markdown(fact_path)
+            fact_id = str(fact.get("id") or "")
+            if not fact_id or fact_id != fact_path.stem:
+                raise MemoryStorageCorruption(f"Fact id mismatch for {fact_path}")
+            entries[fact_id] = {"path": fact_path.relative_to(path.parent).as_posix()}
+        return entries
+
+    def _legacy_agent_memory_path(self, path: Path, agent_name: str) -> Path:
+        return path.parent / "agents" / agent_name.lower() / path.name
+
+    def _migrate_legacy_agent_file(self, path: Path, agent_name: str, *, user_id: str | None) -> bool:
+        """Move facts out of the former per-agent memory.json on first access."""
+        legacy_path = self._legacy_agent_memory_path(path, agent_name)
+        if not legacy_path.exists():
+            return False
+        legacy_memory = self._load_memory_file(legacy_path)
+        if legacy_memory is None:
+            return False
+        document = self._document_from_memory_file(legacy_memory, legacy_path, agent_name)
+        global_memory = self._load_memory_file(path)
+        if global_memory is not None:
+            document["user"] = copy.deepcopy(global_memory.get("user", {}))
+            document["history"] = copy.deepcopy(global_memory.get("history", {}))
+        document["revision"] = int((global_memory or {}).get("revision") or 0)
+        if not self.save(document, agent_name, user_id=user_id, expected_revision=document["revision"]):
+            raise MemoryStorageError(f"Failed to migrate legacy agent memory {legacy_path}")
+        legacy_path.unlink(missing_ok=True)
+        return True
+
+    def _load_memory_file(self, path: Path) -> dict[str, Any] | None:
         if not path.exists():
             return None
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError, UnicodeError) as exc:
-            raise MemoryStorageCorruption(f"Failed to load memory manifest {path}: {exc}") from exc
+            raise MemoryStorageCorruption(f"Failed to load global memory JSON {path}: {exc}") from exc
         if not isinstance(value, dict):
-            raise MemoryStorageCorruption(f"Memory manifest {path} is not an object")
+            raise MemoryStorageCorruption(f"Global memory JSON {path} is not an object")
         return value
 
     def _recover_if_needed(self, path: Path) -> None:
@@ -314,6 +371,9 @@ class FileMemoryStorage(MemoryStorage):
             operation_id = str(journal["operationId"])
             state = journal.get("state")
             old_entries = journal.get("oldEntries", {})
+            agent_name = journal.get("agentName")
+            if agent_name is not None and not isinstance(agent_name, str):
+                raise TypeError("agentName must be a string or null")
         except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
             raise MemoryStorageCorruption(f"Invalid memory operation journal {journal_path}: {exc}") from exc
         recovery_dir = path.parent / ".recovery" / operation_id
@@ -327,7 +387,9 @@ class FileMemoryStorage(MemoryStorage):
                 old_ids = set(old_entries)
                 for fact_id in journal.get("factIds", []):
                     if fact_id not in old_ids:
-                        fact_file_path(path, str(fact_id)).unlink(missing_ok=True)
+                        if agent_name is None:
+                            raise MemoryStorageCorruption(f"Journal {journal_path} contains facts without agentName")
+                        fact_file_path(path, str(fact_id), agent_name=agent_name).unlink(missing_ok=True)
                 for fact_id, entry in old_entries.items():
                     if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
                         continue
@@ -340,57 +402,65 @@ class FileMemoryStorage(MemoryStorage):
             shutil.rmtree(recovery_dir)
         journal_path.unlink(missing_ok=True)
 
-    def _document_from_manifest(self, manifest: dict[str, Any], path: Path) -> dict[str, Any]:
-        entries = manifest.get("facts", {})
-        if isinstance(entries, list):
-            # Legacy v1 document; it remains readable and is migrated on next save.
-            result = copy.deepcopy(manifest)
-            result.setdefault("revision", 0)
-            return result
-        if not isinstance(entries, dict):
-            raise MemoryStorageCorruption(f"Manifest facts in {path} must be a mapping")
-        facts: list[dict[str, Any]] = []
-        for fact_id, entry in entries.items():
-            if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
-                raise MemoryStorageCorruption(f"Invalid manifest entry for fact {fact_id!r}")
-            fact_path = path.parent / entry["path"]
-            fact = _parse_fact_markdown(fact_path)
-            raw = fact_path.read_bytes()
-            if entry.get("contentHash") != _content_hash(raw):
-                raise MemoryStorageCorruption(f"Hash mismatch for canonical fact {fact_id!r}")
-            if str(fact.get("id")) != str(fact_id):
-                raise MemoryStorageCorruption(f"Fact id mismatch for {fact_path}")
-            facts.append(fact)
-        result = {key: copy.deepcopy(value) for key, value in manifest.items() if key != "facts"}
+    def _document_from_memory_file(self, memory_file: dict[str, Any], path: Path, agent_name: str | None) -> dict[str, Any]:
+        """Build the compatibility document without persisting facts in JSON."""
+        legacy_facts = memory_file.get("facts")
+        if isinstance(legacy_facts, list):
+            facts = copy.deepcopy(legacy_facts) if agent_name is not None else []
+        elif isinstance(legacy_facts, dict):
+            facts = []
+            if agent_name is not None:
+                for fact_id, entry in legacy_facts.items():
+                    if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+                        raise MemoryStorageCorruption(f"Invalid legacy manifest entry for fact {fact_id!r}")
+                    fact_path = path.parent / entry["path"]
+                    fact = _parse_fact_markdown(fact_path)
+                    if entry.get("contentHash") and entry.get("contentHash") != _content_hash(fact_path.read_bytes()):
+                        raise MemoryStorageCorruption(f"Hash mismatch for canonical fact {fact_id!r}")
+                    facts.append(fact)
+        elif legacy_facts is None:
+            facts = self._load_agent_facts(path, agent_name)
+        else:
+            raise MemoryStorageCorruption(f"Legacy facts in {path} must be a list or mapping")
+        result = {key: copy.deepcopy(value) for key, value in memory_file.items() if key != "facts"}
+        result.setdefault("revision", 0)
         result["facts"] = facts
         return result
 
-    def _read_document(self, path: Path) -> dict[str, Any]:
-        manifest = self._load_manifest(path)
-        return create_empty_memory() if manifest is None else self._document_from_manifest(manifest, path)
+    def _read_document(self, path: Path, agent_name: str | None) -> dict[str, Any]:
+        memory_file = self._load_memory_file(path)
+        if memory_file is None:
+            result = create_empty_memory()
+            result["facts"] = self._load_agent_facts(path, agent_name)
+            return result
+        return self._document_from_memory_file(memory_file, path, agent_name)
 
     def load(self, agent_name: str | None = None, *, user_id: str | None = None) -> dict[str, Any]:
         path = self._get_memory_file_path(agent_name, user_id=user_id)
         key = self._cache_key(agent_name, user_id=user_id)
+        if agent_name is not None:
+            self._migrate_legacy_agent_file(path, agent_name, user_id=user_id)
         journal_path = path.parent / ".memory.journal.json"
         if journal_path.exists():
             with self._scope_lock(key), _process_file_lock(path.parent / ".memory.lock", float(getattr(self._config, "file_lock_timeout_seconds", 10))):
                 self._recover_if_needed(path)
-        signature = _file_signature(path)
+        signature = self._scope_signature(path, agent_name)
         with self._cache_lock:
             cached = self._memory_cache.get(key)
             if cached is not None and cached[1] == signature:
                 return copy.deepcopy(cached[0])
-        document = self._read_document(path)
-        if path.exists() and document.get("version") != DOCUMENT_VERSION:
+        memory_file = self._load_memory_file(path)
+        document = self._read_document(path, agent_name)
+        needs_migration = memory_file is not None and (memory_file.get("version") != DOCUMENT_VERSION or "facts" in memory_file)
+        if agent_name is not None and needs_migration:
             try:
                 if not self.save(document, agent_name, user_id=user_id, expected_revision=int(document.get("revision") or 0)):
                     raise MemoryStorageError(f"Failed to migrate legacy memory document {path}")
             except MemoryRevisionConflict:
                 # Another reader completed the one-time migration first.
                 pass
-            document = self._read_document(path)
-            signature = _file_signature(path)
+            document = self._read_document(path, agent_name)
+            signature = self._scope_signature(path, agent_name)
         with self._cache_lock:
             self._memory_cache[key] = (copy.deepcopy(document), signature)
         return copy.deepcopy(document)
@@ -398,19 +468,23 @@ class FileMemoryStorage(MemoryStorage):
     def reload(self, agent_name: str | None = None, *, user_id: str | None = None) -> dict[str, Any]:
         path = self._get_memory_file_path(agent_name, user_id=user_id)
         key = self._cache_key(agent_name, user_id=user_id)
+        if agent_name is not None:
+            self._migrate_legacy_agent_file(path, agent_name, user_id=user_id)
         if (path.parent / ".memory.journal.json").exists():
             with self._scope_lock(key), _process_file_lock(path.parent / ".memory.lock", float(getattr(self._config, "file_lock_timeout_seconds", 10))):
                 self._recover_if_needed(path)
-        document = self._read_document(path)
-        if path.exists() and document.get("version") != DOCUMENT_VERSION:
+        memory_file = self._load_memory_file(path)
+        document = self._read_document(path, agent_name)
+        needs_migration = memory_file is not None and (memory_file.get("version") != DOCUMENT_VERSION or "facts" in memory_file)
+        if agent_name is not None and needs_migration:
             try:
                 if not self.save(document, agent_name, user_id=user_id, expected_revision=int(document.get("revision") or 0)):
                     raise MemoryStorageError(f"Failed to migrate legacy memory document {path}")
             except MemoryRevisionConflict:
                 # Another reader completed the one-time migration first.
                 pass
-            document = self._read_document(path)
-        signature = _file_signature(path)
+            document = self._read_document(path, agent_name)
+        signature = self._scope_signature(path, agent_name)
         with self._cache_lock:
             self._memory_cache[key] = (copy.deepcopy(document), signature)
         return copy.deepcopy(document)
@@ -422,11 +496,14 @@ class FileMemoryStorage(MemoryStorage):
         agent_name: str | None = None,
     ) -> dict[str, Any]:
         """Run the idempotent version-driven migration for one exact scope."""
+        if agent_name is None:
+            raise ValueError("agent_name is required to migrate legacy facts")
         before_path = self._get_memory_file_path(agent_name, user_id=user_id)
-        before = self._load_manifest(before_path)
+        before = self._load_memory_file(before_path)
+        needed = before is not None and (before.get("version") != DOCUMENT_VERSION or "facts" in before)
         document = self.reload(agent_name, user_id=user_id)
         return {
-            "migrated": before is not None and before.get("version") != DOCUMENT_VERSION,
+            "migrated": needed,
             "fromVersion": None if before is None else before.get("version"),
             "toVersion": document.get("version"),
             "revision": document.get("revision", 0),
@@ -449,17 +526,17 @@ class FileMemoryStorage(MemoryStorage):
         try:
             with self._scope_lock(key), _process_file_lock(lock_path, float(getattr(self._config, "file_lock_timeout_seconds", 10))):
                 self._recover_if_needed(path)
-                current_manifest = self._load_manifest(path)
-                current_revision = int((current_manifest or {}).get("revision") or 0)
+                current_memory_file = self._load_memory_file(path)
+                current_revision = int((current_memory_file or {}).get("revision") or 0)
                 if expected_revision is not None and expected_revision != current_revision:
-                    raise MemoryRevisionConflict(f"Expected manifest revision {expected_revision}, found {current_revision}")
-                old_entries = (current_manifest or {}).get("facts", {})
-                if not isinstance(old_entries, dict):
-                    old_entries = {}
+                    raise MemoryRevisionConflict(f"Expected user-memory revision {expected_revision}, found {current_revision}")
                 facts_raw = memory_data.get("facts", [])
                 if not isinstance(facts_raw, list):
                     raise ValueError("memory_data.facts must be a list")
-                facts = [_normalize_fact(fact, scope=scope) for fact in facts_raw if isinstance(fact, dict)]
+                if agent_name is None and facts_raw:
+                    raise ValueError("agent_name is required to persist facts")
+                old_entries = self._agent_entries(path, agent_name)
+                facts = [_normalize_fact(fact, scope=scope) for fact in facts_raw if isinstance(fact, dict)] if agent_name is not None else []
                 ids = [fact["id"] for fact in facts]
                 if len(ids) != len(set(ids)):
                     raise ValueError("Duplicate fact ids are not allowed")
@@ -467,15 +544,17 @@ class FileMemoryStorage(MemoryStorage):
                 journal = {
                     "operationId": uuid.uuid4().hex,
                     "state": "prepared",
+                    "agentName": agent_name,
                     "expectedRevision": current_revision,
                     "nextRevision": next_revision,
                     "factIds": ids,
                     "oldEntries": copy.deepcopy(old_entries),
                 }
                 recovery_dir = path.parent / ".recovery" / journal["operationId"]
-                if current_manifest is not None:
+                if current_memory_file is not None or old_entries:
                     recovery_dir.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(path, recovery_dir / "memory.json")
+                    if current_memory_file is not None:
+                        shutil.copy2(path, recovery_dir / "memory.json")
                     for old_fact_id, old_entry in old_entries.items():
                         if isinstance(old_entry, dict) and isinstance(old_entry.get("path"), str):
                             old_fact_path = path.parent / old_entry["path"]
@@ -485,13 +564,13 @@ class FileMemoryStorage(MemoryStorage):
 
                 entries: dict[str, Any] = {}
                 for fact in facts:
-                    fact_path = fact_file_path(path, fact["id"])
+                    if agent_name is None:  # guarded above; keeps the type checker honest
+                        raise ValueError("agent_name is required to persist facts")
+                    fact_path = fact_file_path(path, fact["id"], agent_name=agent_name)
                     raw = _render_fact_markdown(fact)
                     _atomic_write(fact_path, raw)
                     entries[fact["id"]] = {
                         "path": fact_path.relative_to(path.parent).as_posix(),
-                        "revision": fact["revision"],
-                        "contentHash": _content_hash(raw),
                     }
                     notifications.append(("upsert", fact, str(fact_path)))
 
@@ -504,22 +583,30 @@ class FileMemoryStorage(MemoryStorage):
                             old_path.unlink()
                     notifications.append(("remove", fact_id, None))
 
-                manifest = {
+                if agent_name is None:
+                    user_section = copy.deepcopy(memory_data.get("user", {}))
+                    history_section = copy.deepcopy(memory_data.get("history", {}))
+                else:
+                    # Agent conversations may contain project-specific summaries.
+                    # Only a global (agent_name=None) write may change user/history.
+                    base = current_memory_file or create_empty_memory()
+                    user_section = copy.deepcopy(base.get("user", {}))
+                    history_section = copy.deepcopy(base.get("history", {}))
+                memory_file = {
                     "version": DOCUMENT_VERSION,
                     "revision": next_revision,
                     "lastUpdated": utc_now_iso_z(),
-                    "user": copy.deepcopy(memory_data.get("user", {})),
-                    "history": copy.deepcopy(memory_data.get("history", {})),
-                    "facts": entries,
+                    "user": user_section,
+                    "history": history_section,
                 }
-                _atomic_write(path, json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"))
+                _atomic_write(path, json.dumps(memory_file, ensure_ascii=False, indent=2).encode("utf-8"))
                 journal["state"] = "committed"
                 _atomic_write(journal_path, json.dumps(journal, ensure_ascii=False, indent=2).encode("utf-8"))
                 if recovery_dir.exists():
                     shutil.rmtree(recovery_dir)
                 journal_path.unlink(missing_ok=True)
-                document = self._document_from_manifest(manifest, path)
-                signature = _file_signature(path)
+                document = self._document_from_memory_file(memory_file, path, agent_name)
+                signature = self._scope_signature(path, agent_name)
                 with self._cache_lock:
                     self._memory_cache[key] = (copy.deepcopy(document), signature)
         except MemoryRevisionConflict:
@@ -585,6 +672,9 @@ class FileMemoryStorage(MemoryStorage):
         expected_manifest_revision: int | None = None,
     ) -> dict[str, Any]:
         """Commit summary/fact changes through the same journaled save path."""
+        has_fact_changes = bool(change_set.get("upserts") or change_set.get("deletes"))
+        if has_fact_changes and agent_name is None:
+            raise ValueError("agent_name is required for fact repository changes")
         document = self.load(agent_name, user_id=user_id)
         by_id = {str(fact.get("id")): copy.deepcopy(fact) for fact in document.get("facts", [])}
         for fact_id in change_set.get("deletes", []):
@@ -597,7 +687,7 @@ class FileMemoryStorage(MemoryStorage):
             fact["id"] = normalized_id
             by_id[normalized_id] = fact
         summaries = change_set.get("summaries")
-        if summaries is not None:
+        if summaries is not None and agent_name is None:
             if not isinstance(summaries, dict):
                 raise ValueError("change_set.summaries must be an object")
             for section in ("user", "history"):
@@ -617,6 +707,8 @@ class FileMemoryStorage(MemoryStorage):
         agent_name: str | None = None,
         expected_revision: int | None = None,
     ) -> dict[str, Any]:
+        if agent_name is None:
+            raise ValueError("agent_name is required to upsert a fact")
         return self.apply_changes(
             {"upserts": [fact]},
             user_id=user_id,
@@ -632,6 +724,8 @@ class FileMemoryStorage(MemoryStorage):
         agent_name: str | None = None,
         expected_revision: int | None = None,
     ) -> dict[str, Any]:
+        if agent_name is None:
+            raise ValueError("agent_name is required to delete a fact")
         return self.apply_changes(
             {"deletes": [fact_id]},
             user_id=user_id,
@@ -656,12 +750,13 @@ class FileMemoryStorage(MemoryStorage):
         agent_name: str | None = None,
         expected_revision: int | None = None,
     ) -> dict[str, Any]:
-        return self.apply_changes(
-            {"summaries": summaries},
-            user_id=user_id,
-            agent_name=agent_name,
-            expected_manifest_revision=expected_revision,
-        )
+        # Summaries are always user-global, never agent-specific.
+        document = self.load(user_id=user_id)
+        document.update({key: copy.deepcopy(value) for key, value in summaries.items() if key in {"user", "history"}})
+        expected = int(document.get("revision") or 0) if expected_revision is None else expected_revision
+        if not self.save(document, user_id=user_id, expected_revision=expected):
+            raise MemoryStorageError("Failed to update global memory summaries")
+        return self.reload(user_id=user_id)
 
     def notify_fact_upsert(self, fact: dict[str, Any], *, path: str = "") -> bool:
         if self._retrieval is None:
@@ -718,10 +813,13 @@ class FileMemoryStorage(MemoryStorage):
         else:
             for scope in scopes:
                 kwargs = self._scope_kwargs(scope)
-                manifest_path = self._get_memory_file_path(**kwargs)
+                memory_path = self._get_memory_file_path(**kwargs)
+                agent_name = kwargs.get("agent_name")
+                if agent_name is None:
+                    continue
                 for fact in self.list_facts(**kwargs):
                     try:
-                        self.notify_fact_upsert(fact, path=str(fact_file_path(manifest_path, fact["id"])))
+                        self.notify_fact_upsert(fact, path=str(fact_file_path(memory_path, fact["id"], agent_name=agent_name)))
                         indexed += 1
                     except (OSError, ValueError):
                         failed += 1
@@ -734,7 +832,7 @@ class FileMemoryStorage(MemoryStorage):
         }
 
     def capabilities(self) -> set[str]:
-        capabilities = {"file", "markdown-facts", "manifest", "revision", "journal", "fact-repository", "substring-fallback"}
+        capabilities = {"file", "markdown-facts", "global-summary-json", "revision", "journal", "fact-repository", "substring-fallback"}
         if self._retrieval is not None:
             capabilities.add("retrieval")
         return capabilities

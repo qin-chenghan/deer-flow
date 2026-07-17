@@ -781,7 +781,7 @@ Across sessions, DeerFlow builds a persistent memory of your profile, preference
 
 Memory updates now skip duplicate fact entries at apply time, so repeated preferences and context do not accumulate endlessly across sessions.
 
-File-backed memory keeps the existing `(user_id, agent_name)` isolation while storing each fact canonically as one Markdown file with YAML front matter. The scope's `memory.json` now contains summaries plus a revisioned fact manifest. Journaled multi-file commits, scope locks, hashes, and optimistic revisions prevent silent lost updates; legacy JSON fact arrays migrate on first access. Retrieval engines remain optional behind the memory retrieval-adapter contract, with an explicit local substring fallback when no adapter is configured.
+File-backed memory now separates global user context from agent facts. Each user has one `memory.json` containing only the project-independent `user` and `history` summaries; every fact is a canonical Markdown file below `agents/{agent_name}/facts/`. Runtime/API readers still receive a compatibility `facts` array (empty for the global user view), so the frontend does not read agent facts from `memory.json`. Journaled writes, a shared user lock, and optimistic user-memory revisions prevent silent lost updates. Retrieval engines remain optional behind the memory retrieval-adapter contract, with an explicit local substring fallback when no adapter is configured.
 
 ## Recommended Models
 

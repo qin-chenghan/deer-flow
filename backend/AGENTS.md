@@ -559,12 +559,12 @@ The cached value is reused for both the blocking (`runs.wait`) and streaming (`_
 - `updater.py` - LLM-based memory updates with fact extraction, whitespace-normalized fact deduplication, optimistic revision checks, and repository change sets
 - `queue.py` - Debounced update queue (per-thread deduplication, configurable wait time); captures `user_id` at enqueue time so it survives the `threading.Timer` boundary
 - `prompt.py` - Prompt templates for memory updates
-- `storage.py` - File repository with single-fact Markdown, JSON manifests/summaries, journal recovery, file locks, revisions/hashes, deep-copy caching, and an optional retrieval adapter; scope remains `(user_id, agent_name)`
+- `storage.py` - File repository with one user-global summary JSON, agent-owned single-fact Markdown, journal recovery, a shared user lock, revisions, deep-copy caching, and an optional retrieval adapter
 - `tools.py` - Tool-driven memory mode (`memory_search`, `memory_add`, `memory_update`, `memory_delete`) using the same storage/update primitives
 
 **Per-User Isolation**:
 - Memory is stored per-user at `{base_dir}/users/{user_id}/memory.json`
-- Per-agent per-user memory at `{base_dir}/users/{user_id}/agents/{agent_name}/memory.json`
+- Per-agent facts at `{base_dir}/users/{user_id}/agents/{agent_name}/facts/{id-prefix}/{fact-id}.md`; there is no per-agent `memory.json`
 - Custom agent definitions (`SOUL.md` + `config.yaml`) are also per-user at `{base_dir}/users/{user_id}/agents/{agent_name}/`. The legacy shared layout `{base_dir}/agents/{agent_name}/` remains read-only fallback for unmigrated installations
 - Middleware mode captures `user_id` via `get_effective_user_id()` at enqueue time; tool mode resolves `user_id` and `agent_name` from `ToolRuntime.context` via `resolve_runtime_user_id(runtime)` so tool calls stay scoped to the authenticated user and active custom agent
 - The `/api/memory*` endpoints resolve the owner through `_resolve_memory_user_id(request)`: trusted internal callers (IM channel workers carrying the `X-DeerFlow-Owner-User-Id` header, e.g. a bound `/memory` command) act for the connection owner; browser/API callers fall back to `get_effective_user_id()`. The header is only honored after `AuthMiddleware` validated the internal token, mirroring `get_trusted_internal_owner_user_id` used by the threads router
@@ -572,18 +572,19 @@ The cached value is reused for both the blocking (`runs.wait`) and streaming (`_
 - Absolute `storage_path` in config opts out of per-user isolation
 - **Migration**: Run `PYTHONPATH=. python scripts/migrate_user_isolation.py` to move legacy `memory.json`, `threads/`, and `agents/` into per-user layout. Supports `--dry-run` (preview changes) and `--user-id USER_ID` (assign unowned legacy data to a user, defaults to `default`).
 
-**Data Structure** (stored in `{base_dir}/users/{user_id}/memory.json`):
+**Data Structure**:
 - **User Context**: `workContext`, `personalContext`, `topOfMind` (1-3 sentence summaries)
 - **History**: `recentMonths`, `earlierContext`, `longTermBackground`
-- **Facts**: Schema-v2 Markdown documents under `facts/{id-prefix}/{fact-id}.md`; YAML front matter contains structure and the body contains the atomic fact
-- **Manifest**: `memory.json` stores summaries plus fact path/revision/hash entries rather than duplicating full fact content
+- **Global JSON**: `{base_dir}/users/{user_id}/memory.json` stores only `version`, shared revision/time, `user`, and `history`; it never stores facts or a fact index
+- **Facts**: Schema-v2 Markdown documents under `agents/{agent_name}/facts/{id-prefix}/{fact-id}.md`; YAML front matter contains structure and the body contains the atomic fact
+- **Compatibility view**: storage/Manager loads still return `facts: []` for global reads and the selected agent's fact list for an explicit agent read, so API schemas remain stable
 - **Repository**: `get/list/upsert/delete_fact`, `apply_changes`, summary operations, migration, index lifecycle/status, and scoped search; whole-document `load/save` remains for compatibility
 
 **Workflow**:
 - `memory.mode: middleware` (default) keeps the passive path: `MemoryMiddleware` filters messages (user inputs + final AI responses), captures `user_id` via `get_effective_user_id()`, queues conversation with the captured `user_id`, and the debounced background thread invokes the LLM to extract context updates and facts using the stored `user_id`.
 - `memory.mode: tool` skips `MemoryMiddleware` and registers `memory_search`, `memory_add`, `memory_update`, and `memory_delete` on the agent. The model decides when to search, add, update, or delete facts; this is opt-in/experimental and should not be described as better than middleware mode without eval evidence.
 - Both modes share `FileMemoryStorage`, per-user/per-agent isolation, prompt injection, manual CRUD primitives, and the updater backend.
-- Middleware mode queue debounces (30s default), batches updates, and commits through per-scope locks, optimistic manifest revisions, and a recoverable multi-file journal.
+- Middleware mode queue debounces (30s default), batches updates, and commits through a user-level lock, optimistic user-memory revisions, and a recoverable multi-file journal. Agent writes may change only that agent's facts; only `agent_name=None` writes may change global summaries.
 - A configured `retrieval_adapter` owns indexing and semantic retrieval. File storage sends upsert/remove notifications and delegates search; without an adapter it declares and uses `substring_fallback`.
 - Staleness pass (same LLM invocation as the regular updater, no extra API call): when `staleness_review_enabled` is `true` and at least `staleness_min_candidates` aged facts exist, `_select_stale_candidates` selects facts older than their individual review window (`expected_valid_days`, or the global `staleness_age_days` fallback) that are not in `staleness_protected_categories` (default: `correction`), surfaces them in the prompt with a `valid:Nd` annotation, and the LLM judges each as KEEP, REMOVE, or EXTEND. REMOVE entries go in `staleFactsToRemove`; EXTEND entries go in `staleFactsToExtend` with an `extend_by_days` value, which sets the fact's `expected_valid_days` to `min(days_since_created + extend_by_days, staleness_max_extension_days)`. The LLM assigns `expected_valid_days` when creating a fact; it is clamped at write time to `staleness_age_days × staleness_max_lifetime_multiplier` (creation cap). `_apply_updates` enforces the guardrail unconditionally at apply time: it intersects both the removal and extension sets with `_select_stale_candidates` output before applying the per-cycle cap (`staleness_max_removals_per_cycle`), so protected and non-aged facts can never be targeted regardless of model behavior or the feature flag setting. Facts the LLM proposed for removal are excluded from extension even if the per-cycle cap prevented their actual deletion that cycle. Extensions use an absolute ceiling (`staleness_max_extension_days`) rather than the creation multiplier so a deliberate review decision can advance the window beyond the initial cap while preventing `timedelta` overflow from a malformed `extend_by_days`.
 - Consolidation pass (same LLM invocation as the regular updater, no extra API call): when `consolidation_enabled` is `true` and at least one category holds `consolidation_min_facts` or more facts, `_select_consolidation_candidates` identifies fragmented categories and surfaces at most `consolidation_max_groups_per_cycle` of them (largest first) in the prompt. The LLM decides which groups to merge and proposes a synthesised fact per group. `_apply_updates` enforces guardrails: source IDs must exist and must not overlap across groups, group size is capped at `consolidation_max_sources`, the merged fact's confidence cannot exceed the source maximum, and facts below `fact_confidence_threshold` are not written.
@@ -605,10 +606,10 @@ Focused regression coverage for the updater lives in `backend/tests/test_memory_
 **Configuration** (`config.yaml` → `memory`):
 - `enabled` / `injection_enabled` - Master switches
 - `mode` - Operation mode: `middleware` (default passive background extraction) or `tool` (experimental model-driven memory tools). Modes are mutually exclusive.
-- `storage_path` - DeerMem storage root; manifests and Markdown facts remain under user/agent buckets
+- `storage_path` - DeerMem storage root; one global summary JSON lives under each user and Markdown facts remain under agent buckets
 - `storage_class` - `file` or a dotted `MemoryStorage` class; invalid persistent backends fail fast
 - `strict_user_scope` - Require `user_id` for all storage access (default `false` for no-auth/legacy compatibility)
-- `fact_format` / `manifest_filename` - Canonical fact format (`markdown`) and JSON manifest filename
+- `fact_format` / `manifest_filename` - Canonical fact format (`markdown`) and the user-global summary JSON filename (kept as `manifest_filename` for configuration compatibility)
 - `file_lock_timeout_seconds` / `journal_enabled` - Scope-lock wait and required multi-file recovery journal
 - `retrieval_adapter` - Optional dotted factory receiving `DeerMemConfig` and returning a retrieval-port implementation
 - `debounce_seconds` - Wait time before processing (default: 30)

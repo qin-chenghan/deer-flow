@@ -62,7 +62,7 @@ class DeerMemConfig(BaseModel):
     )
     manifest_filename: str = Field(
         default="memory.json",
-        description="Scope manifest filename. Must be a plain .json filename.",
+        description="User-global summary JSON filename. Kept under this name for config compatibility; must be a plain .json filename.",
     )
     file_lock_timeout_seconds: int = Field(
         default=10,
@@ -72,7 +72,7 @@ class DeerMemConfig(BaseModel):
     )
     journal_enabled: Literal[True] = Field(
         default=True,
-        description="Multi-file safety journal; fixed on for the Markdown-plus-manifest backend.",
+        description="Multi-file safety journal; fixed on for global summaries plus agent Markdown facts.",
     )
     retrieval_adapter: str = Field(
         default="",

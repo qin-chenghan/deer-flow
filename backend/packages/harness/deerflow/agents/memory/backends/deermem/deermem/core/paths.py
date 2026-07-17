@@ -2,9 +2,9 @@
 
 The host no longer dictates where DeerMem stores data. Root = ``config.storage_path``
 (if set, absolute or relative) or ``$DEERMEM_DATA_DIR`` or ``~/.deermem/``.
-Per-user / per-agent / legacy layouts live under the root, mirroring the
-pre-abstraction paths so a one-time data migration (old ``{base_dir}/users/*``
--> DeerMem root) is a plain move.
+Each user has one global ``memory.json`` for project-independent summaries.
+Agent-specific facts live below ``agents/{agent_name}/facts`` and never add a
+fact index to that JSON document.
 
 user_id is sanitized in-process (``[A-Za-z0-9_-]`` + SHA-256 digest for lossy
 ids) and agent_name validated against an inlined pattern -- DeerMem does not
@@ -74,8 +74,7 @@ def memory_file_path(
 ) -> Path:
     """Resolve the memory file path under DeerMem's own data root.
 
-    ``config.storage_path`` (absolute or relative) is the root; per-user /
-    per-agent / legacy layouts live under it. Empty -> default root
+    ``config.storage_path`` (absolute or relative) is the root. Empty -> default root
     (``$DEERMEM_DATA_DIR`` / ``~/.deermem/``). The host (deer-flow factory)
     injects an absolute base_dir as ``storage_path`` so memory lands at
     ``{base_dir}/users/{user_id}/memory.json`` (CWD-independent).
@@ -91,22 +90,24 @@ def memory_file_path(
         uid = safe_user_id(user_id)
         if agent_name is not None:
             validate_agent_name(agent_name)
-            bucket = root / "users" / uid / "agents" / agent_name.lower()
-        else:
-            bucket = root / "users" / uid
+        bucket = root / "users" / uid
         return bucket / manifest_filename
     # Legacy: no user_id
     if agent_name is not None:
         validate_agent_name(agent_name)
-        bucket = root / "agents" / agent_name.lower()
-    else:
-        bucket = root
+    bucket = root
     return bucket / manifest_filename
 
 
-def fact_file_path(manifest_path: Path, fact_id: str) -> Path:
-    """Return the sharded Markdown path for a fact under a scope bucket."""
+def agent_facts_directory(memory_path: Path, agent_name: str) -> Path:
+    """Return the fact root for one required agent below a user's memory file."""
+    validate_agent_name(agent_name)
+    return memory_path.parent / "agents" / agent_name.lower() / "facts"
+
+
+def fact_file_path(memory_path: Path, fact_id: str, *, agent_name: str) -> Path:
+    """Return the sharded Markdown path for one agent-owned fact."""
     if not fact_id or not re.fullmatch(r"[A-Za-z0-9_-]+", fact_id):
         raise ValueError("Fact id may contain only letters, numbers, '_' and '-'.")
     prefix = fact_id[:2].lower() if len(fact_id) >= 2 else "__"
-    return manifest_path.parent / "facts" / prefix / f"{fact_id}.md"
+    return agent_facts_directory(memory_path, agent_name) / prefix / f"{fact_id}.md"

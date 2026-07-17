@@ -598,6 +598,9 @@ class MemoryUpdater:
 
     def import_memory_data(self, memory_data: dict[str, Any], agent_name: str | None = None, *, user_id: str | None = None) -> dict[str, Any]:
         """Persist imported memory data via the injected storage."""
+        if agent_name is None:
+            memory_data = copy.deepcopy(memory_data)
+            memory_data["facts"] = []
         if not self._storage.save(memory_data, agent_name, user_id=user_id):
             raise OSError("Failed to save imported memory data")
         return self._storage.load(agent_name, user_id=user_id)
@@ -626,6 +629,8 @@ class MemoryUpdater:
         existence check (upstream's ``create_memory_fact_with_created_fact``),
         which the vendored copy had dropped together to avoid the dangling id.
         """
+        if agent_name is None:
+            raise ValueError("agent_name")
         normalized_content = content.strip()
         if not normalized_content:
             raise ValueError("content")
@@ -656,6 +661,8 @@ class MemoryUpdater:
 
     def delete_memory_fact(self, fact_id: str, agent_name: str | None = None, *, user_id: str | None = None) -> dict[str, Any]:
         """Delete a fact by its id and persist the updated memory data."""
+        if agent_name is None:
+            raise ValueError("agent_name")
         memory_data = self.get_memory_data(agent_name, user_id=user_id)
         facts = memory_data.get("facts", [])
         updated_facts = [fact for fact in facts if fact.get("id") != fact_id]
@@ -669,6 +676,8 @@ class MemoryUpdater:
 
     def update_memory_fact(self, fact_id: str, content: str | None = None, category: str | None = None, confidence: float | None = None, agent_name: str | None = None, *, user_id: str | None = None) -> dict[str, Any]:
         """Update an existing fact and persist the updated memory data."""
+        if agent_name is None:
+            raise ValueError("agent_name")
         memory_data = self.get_memory_data(agent_name, user_id=user_id)
         updated_memory = dict(memory_data)
         updated_facts: list[dict[str, Any]] = []
@@ -789,8 +798,8 @@ class MemoryUpdater:
             current_by_id = {str(fact.get("id")): fact for fact in current_memory.get("facts", [])}
             updated_by_id = {str(fact.get("id")): fact for fact in updated_memory.get("facts", [])}
             change_set = {
-                "upserts": [copy.deepcopy(fact) for fact_id, fact in updated_by_id.items() if current_by_id.get(fact_id) != fact],
-                "deletes": [fact_id for fact_id in current_by_id if fact_id not in updated_by_id],
+                "upserts": [copy.deepcopy(fact) for fact_id, fact in updated_by_id.items() if current_by_id.get(fact_id) != fact] if agent_name is not None else [],
+                "deletes": [fact_id for fact_id in current_by_id if fact_id not in updated_by_id] if agent_name is not None else [],
                 "summaries": {
                     "user": copy.deepcopy(updated_memory.get("user", {})),
                     "history": copy.deepcopy(updated_memory.get("history", {})),
