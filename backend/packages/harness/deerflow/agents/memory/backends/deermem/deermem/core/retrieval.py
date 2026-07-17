@@ -22,6 +22,18 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# ── Scoring weights ──────────────────────────────────────────────────
+#
+# SQLite FTS5 ``bm25(memory_fts)`` (no positional params → defaults K1=1.2,
+# B=0.75) returns a negative value whose magnitude scales with document
+# relevance.  Critically the function takes positional params in order
+# ``(table, k1, b, *column_weights)``: the original code passed
+# ``bm25(..., 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)``, which set **k1 = 0**
+# and silently zeroed out the entire BM25 score (disabled tf saturation),
+# collapsing ranking to ``confidence * _CONFIDENCE_WEIGHT``.  Use the
+# no-arg form so SQLite defaults apply and BM25 is actually scored.
+_CONFIDENCE_WEIGHT = 0.2
+
 
 # ── jieba (optional) ──────────────────────────────────────────────────
 
@@ -254,7 +266,7 @@ class FTS5Retrieval:
         sql = f"""
             SELECT doc_id, content, category, scope_user, scope_agent,
                    created_at, confidence,
-                   bm25(memory_fts, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0) AS bm25_score
+                   bm25(memory_fts) AS bm25_score
             FROM memory_fts
             WHERE {where_clause}
             ORDER BY bm25_score
@@ -310,8 +322,13 @@ class FTS5Retrieval:
         confidence: float,
         created_at: str,
     ) -> float:
-        """Combined score: BM25 × time_decay + confidence weight."""
-        score = bm25_score * 1.0
+        """Combined score: BM25 × time_decay + confidence weight.
+
+        ``bm25_score`` is negative for relevant docs (SQLite FTS5 convention).
+        The caller negates it (``-bm25_score``) before storing in the result
+        dict, so here we treat it as positive relevance magnitude.
+        """
+        score = bm25_score
 
         try:
             dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
@@ -321,7 +338,7 @@ class FTS5Retrieval:
         except (ValueError, TypeError):
             pass
 
-        score += confidence * 0.2
+        score += confidence * _CONFIDENCE_WEIGHT
 
         return score
 

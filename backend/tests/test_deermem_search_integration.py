@@ -419,12 +419,11 @@ class TestTimeDecayFromDisk:
         recent_score = next(r["score"] for r in results if r["id"] == "recent_f")
         old_score = next(r["score"] for r in results if r["id"] == "old_f")
 
-        # Identical content + identical confidence -> BM25 equal (0).
-        # With BM25=0, time-decay has no multiplicative effect on the BM25
-        # term, so both scores are reduced to confidence*0.2 = 0.18. We
-        # lock in that the engine produces consistent scores for this edge
-        # case (it documents a known limitation: short-doc BM25 = 0).
-        assert recent_score == old_score, f"short-doc BM25=0 → decay has no effect; recent={recent_score} old={old_score}"
+        # Identical content + identical confidence -> BM25 identical for both.
+        # Time-decay should then push recent_f above old_f by the multiplicative
+        # factor on the BM25 term, plus an identical confidence*0.2 floor that
+        # cancels in the comparison.
+        assert recent_score > old_score, f"recent_f should rank above old_f; recent={recent_score:.6f} old={old_score:.6f}"
         # Sanity: scores are at least the confidence floor
         assert recent_score >= 0.9 * 0.2 - 1e-9
 
