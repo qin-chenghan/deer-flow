@@ -52,6 +52,32 @@ class DeerMemConfig(BaseModel):
         default="",
         description="Dotted class path for an alternative storage provider; empty (default) = FileMemoryStorage (no importlib, portable).",
     )
+    strict_user_scope: bool = Field(
+        default=False,
+        description="Require user_id for every storage scope. False preserves no-auth and legacy callers.",
+    )
+    fact_format: Literal["markdown"] = Field(
+        default="markdown",
+        description="Canonical per-fact persistence format. This release supports Markdown with YAML front matter.",
+    )
+    manifest_filename: str = Field(
+        default="memory.json",
+        description="Scope manifest filename. Must be a plain .json filename.",
+    )
+    file_lock_timeout_seconds: int = Field(
+        default=10,
+        ge=1,
+        le=120,
+        description="Maximum wait for the per-scope cross-process advisory file lock.",
+    )
+    journal_enabled: Literal[True] = Field(
+        default=True,
+        description="Multi-file safety journal; fixed on for the Markdown-plus-manifest backend.",
+    )
+    retrieval_adapter: str = Field(
+        default="",
+        description="Optional dotted retrieval-adapter factory. It receives DeerMemConfig and must implement RetrievalPort.",
+    )
     # ── Queue ────────────────────────────────────────────────────────────
     debounce_seconds: int = Field(
         default=30,

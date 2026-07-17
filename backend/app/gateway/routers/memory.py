@@ -1,6 +1,6 @@
 """Memory API router for retrieving and managing global memory data."""
 
-from typing import Literal
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -65,16 +65,26 @@ class Fact(BaseModel):
     id: str = Field(..., description="Unique identifier for the fact")
     content: str = Field(..., description="Fact content")
     category: str = Field(default="context", description="Fact category")
+    categoryExtension: str | None = Field(default=None, description="Extension category when category is 'other'")
+    topics: list[str] | None = Field(default=None, description="Retrieval-oriented topic labels")
     confidence: float = Field(default=0.5, description="Confidence score (0-1)")
     createdAt: str = Field(default="", description="Creation timestamp")
-    source: str = Field(default="unknown", description="Source thread ID")
+    source: str | dict[str, Any] = Field(default="unknown", description="Structured source metadata; legacy strings remain readable")
     sourceError: str | None = Field(default=None, description="Optional description of the prior mistake or wrong approach")
+    schemaVersion: int | None = Field(default=None, description="Per-fact schema version")
+    status: str | None = Field(default=None, description="Fact lifecycle status")
+    scope: dict[str, str | None] | None = Field(default=None, description="Canonical user/agent scope")
+    revision: int | None = Field(default=None, description="Fact optimistic revision")
+    updatedAt: str | None = Field(default=None, description="Last fact update timestamp")
+    consolidatedAt: str | None = None
+    consolidatedFrom: list[str] | None = None
 
 
 class MemoryResponse(BaseModel):
     """Response model for memory data."""
 
     version: str = Field(default="1.0", description="Memory schema version")
+    revision: int | None = Field(default=None, description="Manifest revision")
     lastUpdated: str = Field(default="", description="Last update timestamp")
     user: UserContext = Field(default_factory=UserContext)
     history: HistoryContext = Field(default_factory=HistoryContext)

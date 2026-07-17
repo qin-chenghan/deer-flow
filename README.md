@@ -781,6 +781,8 @@ Across sessions, DeerFlow builds a persistent memory of your profile, preference
 
 Memory updates now skip duplicate fact entries at apply time, so repeated preferences and context do not accumulate endlessly across sessions.
 
+File-backed memory keeps the existing `(user_id, agent_name)` isolation while storing each fact canonically as one Markdown file with YAML front matter. The scope's `memory.json` now contains summaries plus a revisioned fact manifest. Journaled multi-file commits, scope locks, hashes, and optimistic revisions prevent silent lost updates; legacy JSON fact arrays migrate on first access. Retrieval engines remain optional behind the memory retrieval-adapter contract, with an explicit local substring fallback when no adapter is configured.
+
 ## Recommended Models
 
 DeerFlow is model-agnostic — it works with any LLM that implements the OpenAI-compatible API. That said, it performs best with models that support:

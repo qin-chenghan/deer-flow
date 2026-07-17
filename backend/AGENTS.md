@@ -556,10 +556,10 @@ The cached value is reused for both the blocking (`runs.wait`) and streaming (`_
 ### Memory System (`packages/harness/deerflow/agents/memory/`)
 
 **Components**:
-- `updater.py` - LLM-based memory updates with fact extraction, whitespace-normalized fact deduplication (trims leading/trailing whitespace before comparing), and atomic file I/O
+- `updater.py` - LLM-based memory updates with fact extraction, whitespace-normalized fact deduplication, optimistic revision checks, and repository change sets
 - `queue.py` - Debounced update queue (per-thread deduplication, configurable wait time); captures `user_id` at enqueue time so it survives the `threading.Timer` boundary
 - `prompt.py` - Prompt templates for memory updates
-- `storage.py` - File-based storage with per-user isolation; cache keyed by `(user_id, agent_name)` tuple
+- `storage.py` - File repository with single-fact Markdown, JSON manifests/summaries, journal recovery, file locks, revisions/hashes, deep-copy caching, and an optional retrieval adapter; scope remains `(user_id, agent_name)`
 - `tools.py` - Tool-driven memory mode (`memory_search`, `memory_add`, `memory_update`, `memory_delete`) using the same storage/update primitives
 
 **Per-User Isolation**:
@@ -575,13 +575,16 @@ The cached value is reused for both the blocking (`runs.wait`) and streaming (`_
 **Data Structure** (stored in `{base_dir}/users/{user_id}/memory.json`):
 - **User Context**: `workContext`, `personalContext`, `topOfMind` (1-3 sentence summaries)
 - **History**: `recentMonths`, `earlierContext`, `longTermBackground`
-- **Facts**: Discrete facts with `id`, `content`, `category` (preference/knowledge/context/behavior/goal), `confidence` (0-1), `createdAt`, `source`
+- **Facts**: Schema-v2 Markdown documents under `facts/{id-prefix}/{fact-id}.md`; YAML front matter contains structure and the body contains the atomic fact
+- **Manifest**: `memory.json` stores summaries plus fact path/revision/hash entries rather than duplicating full fact content
+- **Repository**: `get/list/upsert/delete_fact`, `apply_changes`, summary operations, migration, index lifecycle/status, and scoped search; whole-document `load/save` remains for compatibility
 
 **Workflow**:
 - `memory.mode: middleware` (default) keeps the passive path: `MemoryMiddleware` filters messages (user inputs + final AI responses), captures `user_id` via `get_effective_user_id()`, queues conversation with the captured `user_id`, and the debounced background thread invokes the LLM to extract context updates and facts using the stored `user_id`.
 - `memory.mode: tool` skips `MemoryMiddleware` and registers `memory_search`, `memory_add`, `memory_update`, and `memory_delete` on the agent. The model decides when to search, add, update, or delete facts; this is opt-in/experimental and should not be described as better than middleware mode without eval evidence.
 - Both modes share `FileMemoryStorage`, per-user/per-agent isolation, prompt injection, manual CRUD primitives, and the updater backend.
-- Middleware mode queue debounces (30s default), batches updates, deduplicates per-thread, applies updates atomically (temp file + rename) with cache invalidation, and skips duplicate fact content before append.
+- Middleware mode queue debounces (30s default), batches updates, and commits through per-scope locks, optimistic manifest revisions, and a recoverable multi-file journal.
+- A configured `retrieval_adapter` owns indexing and semantic retrieval. File storage sends upsert/remove notifications and delegates search; without an adapter it declares and uses `substring_fallback`.
 - Staleness pass (same LLM invocation as the regular updater, no extra API call): when `staleness_review_enabled` is `true` and at least `staleness_min_candidates` aged facts exist, `_select_stale_candidates` selects facts older than their individual review window (`expected_valid_days`, or the global `staleness_age_days` fallback) that are not in `staleness_protected_categories` (default: `correction`), surfaces them in the prompt with a `valid:Nd` annotation, and the LLM judges each as KEEP, REMOVE, or EXTEND. REMOVE entries go in `staleFactsToRemove`; EXTEND entries go in `staleFactsToExtend` with an `extend_by_days` value, which sets the fact's `expected_valid_days` to `min(days_since_created + extend_by_days, staleness_max_extension_days)`. The LLM assigns `expected_valid_days` when creating a fact; it is clamped at write time to `staleness_age_days × staleness_max_lifetime_multiplier` (creation cap). `_apply_updates` enforces the guardrail unconditionally at apply time: it intersects both the removal and extension sets with `_select_stale_candidates` output before applying the per-cycle cap (`staleness_max_removals_per_cycle`), so protected and non-aged facts can never be targeted regardless of model behavior or the feature flag setting. Facts the LLM proposed for removal are excluded from extension even if the per-cycle cap prevented their actual deletion that cycle. Extensions use an absolute ceiling (`staleness_max_extension_days`) rather than the creation multiplier so a deliberate review decision can advance the window beyond the initial cap while preventing `timedelta` overflow from a malformed `extend_by_days`.
 - Consolidation pass (same LLM invocation as the regular updater, no extra API call): when `consolidation_enabled` is `true` and at least one category holds `consolidation_min_facts` or more facts, `_select_consolidation_candidates` identifies fragmented categories and surfaces at most `consolidation_max_groups_per_cycle` of them (largest first) in the prompt. The LLM decides which groups to merge and proposes a synthesised fact per group. `_apply_updates` enforces guardrails: source IDs must exist and must not overlap across groups, group size is capped at `consolidation_max_sources`, the merged fact's confidence cannot exceed the source maximum, and facts below `fact_confidence_threshold` are not written.
 - Next interaction injects selected facts + context into `<memory>` tags in the system prompt when `injection_enabled` is true.
@@ -602,7 +605,12 @@ Focused regression coverage for the updater lives in `backend/tests/test_memory_
 **Configuration** (`config.yaml` → `memory`):
 - `enabled` / `injection_enabled` - Master switches
 - `mode` - Operation mode: `middleware` (default passive background extraction) or `tool` (experimental model-driven memory tools). Modes are mutually exclusive.
-- `storage_path` - Path to memory.json (absolute path opts out of per-user isolation)
+- `storage_path` - DeerMem storage root; manifests and Markdown facts remain under user/agent buckets
+- `storage_class` - `file` or a dotted `MemoryStorage` class; invalid persistent backends fail fast
+- `strict_user_scope` - Require `user_id` for all storage access (default `false` for no-auth/legacy compatibility)
+- `fact_format` / `manifest_filename` - Canonical fact format (`markdown`) and JSON manifest filename
+- `file_lock_timeout_seconds` / `journal_enabled` - Scope-lock wait and required multi-file recovery journal
+- `retrieval_adapter` - Optional dotted factory receiving `DeerMemConfig` and returning a retrieval-port implementation
 - `debounce_seconds` - Wait time before processing (default: 30)
 - `shutdown_flush_timeout_seconds` - Host-shared hard budget (seconds) to drain the memory backend's pending-update buffer on Gateway graceful shutdown (default: 30; 1–300). Each pending item does one LLM call, so large IM batches may need more. The Gateway lifespan calls `MemoryManager.shutdown_flush(timeout)` after channels/scheduler stop; the backend short-circuits on an idle buffer, so the host calls it unconditionally (no pending/processing gate). Must fit inside the pod's K8s `terminationGracePeriodSeconds` (gateway Helm chart sets this; default 45s) or K8s SIGKILLs the drain mid-flight.
 - `model_name` - LLM for updates (null = default model)

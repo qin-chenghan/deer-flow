@@ -23,6 +23,7 @@ never breaks those modules at import time (see MemoryManager plan, step 8).
 
 from __future__ import annotations
 
+import copy
 import logging
 from typing import Any
 
@@ -188,6 +189,21 @@ class DeerMem(MemoryManager):
         if not query or not query.strip() or top_k <= 0:
             return []
         query_lower = query.strip().lower()
+        search_facts = getattr(self._storage, "search_facts", None)
+        scopes = [{"userId": user_id, "agentName": agent_name}]
+        indexed = (
+            search_facts(
+                query,
+                scopes=scopes,
+                top_k=top_k,
+                mode="hybrid",
+                filters={"category": category} if category else None,
+            )
+            if callable(search_facts)
+            else []
+        )
+        if indexed:
+            return [copy.deepcopy(result.get("fact", result)) for result in indexed]
         memory_data = self._updater.get_memory_data(agent_name=agent_name, user_id=user_id)
         matched = [fact for fact in memory_data.get("facts", []) if isinstance(fact.get("content"), str) and query_lower in fact["content"].lower() and (category is None or fact.get("category") == category)]
         matched.sort(key=_coerce_source_confidence, reverse=True)

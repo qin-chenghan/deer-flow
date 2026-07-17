@@ -81,15 +81,32 @@ def memory_file_path(
     ``{base_dir}/users/{user_id}/memory.json`` (CWD-independent).
     """
     root = Path(config.storage_path) if config.storage_path else _default_root()
+    if config.strict_user_scope and user_id is None:
+        raise ValueError("user_id is required when strict_user_scope is enabled.")
+    manifest_filename = config.manifest_filename
+    if Path(manifest_filename).name != manifest_filename or not manifest_filename.endswith(".json"):
+        raise ValueError("manifest_filename must be a plain .json filename.")
 
     if user_id is not None:
         uid = safe_user_id(user_id)
         if agent_name is not None:
             validate_agent_name(agent_name)
-            return root / "users" / uid / "agents" / agent_name.lower() / "memory.json"
-        return root / "users" / uid / "memory.json"
+            bucket = root / "users" / uid / "agents" / agent_name.lower()
+        else:
+            bucket = root / "users" / uid
+        return bucket / manifest_filename
     # Legacy: no user_id
     if agent_name is not None:
         validate_agent_name(agent_name)
-        return root / "agents" / agent_name.lower() / "memory.json"
-    return root / "memory.json"
+        bucket = root / "agents" / agent_name.lower()
+    else:
+        bucket = root
+    return bucket / manifest_filename
+
+
+def fact_file_path(manifest_path: Path, fact_id: str) -> Path:
+    """Return the sharded Markdown path for a fact under a scope bucket."""
+    if not fact_id or not re.fullmatch(r"[A-Za-z0-9_-]+", fact_id):
+        raise ValueError("Fact id may contain only letters, numbers, '_' and '-'.")
+    prefix = fact_id[:2].lower() if len(fact_id) >= 2 else "__"
+    return manifest_path.parent / "facts" / prefix / f"{fact_id}.md"
