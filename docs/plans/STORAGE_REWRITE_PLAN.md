@@ -1,7 +1,7 @@
 # DeerMem Storage 改写计划书
 
-> 状态：File/Markdown storage 按本方案实施；project scope 已从本轮撤回，留待独立 PR。检索算法及最终联调签名仍待 retrieval 负责人锁定。实施位置见 [`STORAGE_REWRITE_CHANGES.md`](STORAGE_REWRITE_CHANGES.md)。  
-> 范围：`backends/deermem/deermem/core/` 内的 storage、paths、schema、索引生命周期和后端适配；同时列出 updater、retrieval、injection、queue、Gateway 必须配合的契约。  
+> 状态：File/Markdown storage 按本方案实施；project scope 已从本轮撤回，留待独立 PR。检索算法及最终联调签名仍待 retrieval 负责人锁定。实施位置见 [`STORAGE_REWRITE_CHANGES.md`](STORAGE_REWRITE_CHANGES.md)。<br>
+> 范围：`backends/deermem/deermem/core/` 内的 storage、paths、schema、索引生命周期和后端适配；同时列出 updater、retrieval、injection、queue、Gateway 必须配合的契约。<br>
 > 基线：2026-07-16 当前代码。本文为描述式规格，不包含实现代码。
 
 ## 1. 背景与目标
