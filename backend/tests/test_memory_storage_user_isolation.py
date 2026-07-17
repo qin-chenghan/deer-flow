@@ -82,11 +82,11 @@ class TestUserIsolatedStorage:
         s.save(memory, "test-agent", user_id="alice")
         assert (base_dir / "users" / "alice" / "agents" / "test-agent" / "memory.json").exists()
 
-    def test_cache_key_is_user_agent_tuple(self, base_dir: Path):
-        """Cache keys must be (user_id, agent_name) tuples."""
+    def test_cache_key_is_user_agent_project_tuple(self, base_dir: Path):
+        """Cache keys must include the dynamic project scope."""
         s = FileMemoryStorage(DeerMemConfig())
         s.save(create_empty_memory(), user_id="alice")
-        assert ("alice", None) in s._memory_cache
+        assert ("alice", None, None) in s._memory_cache
 
     def test_reload_with_user_id(self, base_dir: Path):
         """reload() with user_id should force re-read from the user-scoped file."""

@@ -84,6 +84,8 @@ class MemoryMiddleware(AgentMiddleware[MemoryMiddlewareState]):
         # propagated, so we must store user_id explicitly in ConversationContext.
         user_id = get_effective_user_id()
         runtime_context = runtime.context if isinstance(runtime.context, dict) else {}
+        project_id_value = runtime_context.get("project_id")
+        project_id = str(project_id_value) if isinstance(project_id_value, str) and project_id_value else None
         trace_id = normalize_trace_id(runtime_context.get(DEERFLOW_TRACE_METADATA_KEY))
         if trace_id is None:
             try:
@@ -102,6 +104,7 @@ class MemoryMiddleware(AgentMiddleware[MemoryMiddlewareState]):
             messages,
             agent_name=self._agent_name,
             user_id=user_id,
+            project_id=project_id,
             trace_id=trace_id,
         )
 

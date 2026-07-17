@@ -341,6 +341,7 @@ async def task_tool(
     # IM-channel sender identity: group chats share one thread across senders,
     # so delegated bash commands need the dispatching turn's channel_user_id.
     channel_user_id = parent_context.get("channel_user_id")
+    project_id = parent_context.get("project_id") if isinstance(parent_context.get("project_id"), str) else None
     deerflow_trace_id = normalize_trace_id(parent_context.get(DEERFLOW_TRACE_METADATA_KEY)) or normalize_trace_id(metadata.get(DEERFLOW_TRACE_METADATA_KEY)) or get_current_trace_id()
 
     parent_available_skills = metadata.get("available_skills")
@@ -388,6 +389,8 @@ async def task_tool(
         "channel_user_id": channel_user_id,
         "deerflow_trace_id": deerflow_trace_id,
     }
+    if project_id is not None:
+        executor_kwargs["project_id"] = project_id
     if resolved_app_config is not None:
         executor_kwargs["app_config"] = resolved_app_config
     executor = SubagentExecutor(**executor_kwargs)

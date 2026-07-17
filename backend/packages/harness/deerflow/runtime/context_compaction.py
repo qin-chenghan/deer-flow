@@ -63,6 +63,7 @@ async def compact_thread_context(
     force: bool = True,
     user_id: str | None = None,
     agent_name: str | None = None,
+    project_id: str | None = None,
     app_config: AppConfig | None = None,
 ) -> ThreadCompactionResult:
     """Summarize old messages in a thread and write a compacted checkpoint."""
@@ -89,6 +90,8 @@ async def compact_thread_context(
     runtime_context = {"thread_id": thread_id, "user_id": user_id}
     if agent_name:
         runtime_context["agent_name"] = agent_name
+    if project_id:
+        runtime_context["project_id"] = project_id
     runtime = SimpleNamespace(context=runtime_context)
     result = await middleware.acompact_state(state, runtime, force=force)  # type: ignore[arg-type]
     if result is None:

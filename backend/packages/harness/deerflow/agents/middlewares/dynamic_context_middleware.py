@@ -29,7 +29,6 @@ Date-update format:
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import logging
 import re
 import uuid
@@ -39,8 +38,6 @@ from typing import TYPE_CHECKING, override
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.runtime import Runtime
-
-from deerflow.runtime.context_keys import CURRENT_RUN_PRE_EXISTING_MESSAGE_IDS_KEY
 
 if TYPE_CHECKING:
     from deerflow.config.app_config import AppConfig
@@ -148,7 +145,7 @@ class DynamicContextMiddleware(AgentMiddleware):
         self._agent_name = agent_name
         self._app_config = app_config
 
-    def _build_full_reminder(self) -> tuple[str, str | None]:
+    def _build_full_reminder(self, project_id: str | None = None) -> tuple[str, str | None]:
         """Return (date_reminder, memory_block | None).
 
         Framework-owned data (date) is separated from user-owned data (memory)
@@ -159,7 +156,7 @@ class DynamicContextMiddleware(AgentMiddleware):
         from deerflow.agents.lead_agent.prompt import _get_memory_context
 
         injection_enabled = self._app_config.memory.injection_enabled if self._app_config else True
-        memory_context = _get_memory_context(self._agent_name, app_config=self._app_config) if injection_enabled else ""
+        memory_context = _get_memory_context(self._agent_name, app_config=self._app_config, project_id=project_id) if injection_enabled else ""
         current_date = datetime.now().strftime("%Y-%m-%d, %A")
 
         date_reminder = "\n".join(
@@ -239,7 +236,7 @@ class DynamicContextMiddleware(AgentMiddleware):
         )
         return messages
 
-    def _inject(self, state) -> dict | None:
+    def _inject(self, state, runtime: Runtime | None = None) -> dict | None:
         messages = list(state.get("messages", []))
         if not messages:
             return None
@@ -258,7 +255,10 @@ class DynamicContextMiddleware(AgentMiddleware):
             first_idx = next((i for i, m in enumerate(messages) if _is_user_injection_target(m)), None)
             if first_idx is None:
                 return None
-            date_reminder, memory_block = self._build_full_reminder()
+            context = runtime.context if runtime is not None and isinstance(runtime.context, dict) else {}
+            project_value = context.get("project_id")
+            project_id = project_value if isinstance(project_value, str) and project_value else None
+            date_reminder, memory_block = self._build_full_reminder(project_id)
             logger.info(
                 "DynamicContextMiddleware: injecting full reminder (has_memory=%s) into first HumanMessage id=%r",
                 memory_block is not None,
@@ -282,9 +282,7 @@ class DynamicContextMiddleware(AgentMiddleware):
 
     @override
     def before_agent(self, state, runtime: Runtime) -> dict | None:
-        result = self._inject(state)
-        self._record_effective_memory(state, result, runtime)
-        return result
+        return self._inject(state, runtime)
 
     @override
     async def abefore_agent(self, state, runtime: Runtime) -> dict | None:
@@ -297,69 +295,16 @@ class DynamicContextMiddleware(AgentMiddleware):
         # Bounded timeout: if startup warm-up failed silently (e.g. network
         # blip during deploy), the first request's cold tiktoken download can
         # block for tens of minutes (OS TCP timeout).  Time-box injection so
-        # the request degrades gracefully (no new dynamic-context update)
-        # rather than hanging. Frozen context already in state remains active.
+        # the request degrades gracefully (no memory context) rather than
+        # hanging.
         try:
-            result = await asyncio.wait_for(
-                asyncio.to_thread(self._inject, state),
+            return await asyncio.wait_for(
+                asyncio.to_thread(self._inject, state, runtime),
                 timeout=_INJECT_TIMEOUT_SECONDS,
             )
         except TimeoutError:
             logger.warning(
-                "DynamicContextMiddleware: injection timed out (%.1fs); skipping new memory/date injection for this turn",
+                "DynamicContextMiddleware: injection timed out (%.1fs); skipping memory/date injection for this turn",
                 _INJECT_TIMEOUT_SECONDS,
             )
-            self._record_effective_memory(state, None, runtime)
             return None
-        self._record_effective_memory(state, result, runtime)
-        return result
-
-    @staticmethod
-    def _effective_memory_message(state, update: dict | None, runtime: Runtime) -> HumanMessage | None:
-        """Find server-created memory that is effective for this run.
-
-        A first-run block must come from this middleware's update. A reused
-        block must have existed in the checkpoint before the run; the Gateway
-        strips the reminder marker from untrusted input so a caller cannot
-        replace a known checkpoint ID with forged provenance.
-        """
-        if isinstance(update, dict):
-            update_messages = update.get("messages")
-            if isinstance(update_messages, list):
-                for message in update_messages:
-                    if not isinstance(message, HumanMessage):
-                        continue
-                    message_id = str(message.id or "")
-                    if message_id.endswith("__memory") and is_dynamic_context_reminder(message) and isinstance(message.content, str):
-                        return message
-
-        context = getattr(runtime, "context", None)
-        raw_pre_existing_ids = context.get(CURRENT_RUN_PRE_EXISTING_MESSAGE_IDS_KEY) if isinstance(context, dict) else None
-        if not isinstance(raw_pre_existing_ids, (frozenset, set, list, tuple)):
-            return None
-        pre_existing_ids = {str(message_id) for message_id in raw_pre_existing_ids if message_id}
-        for message in state.get("messages", []):
-            if not isinstance(message, HumanMessage):
-                continue
-            message_id = str(message.id or "")
-            if message_id in pre_existing_ids and message_id.endswith("__memory") and is_dynamic_context_reminder(message) and isinstance(message.content, str):
-                return message
-        return None
-
-    def _record_effective_memory(self, state, update: dict | None, runtime: Runtime) -> None:
-        """Attach the effective hidden memory block to the current run ledger."""
-        context = getattr(runtime, "context", None)
-        journal = context.get("__run_journal") if isinstance(context, dict) else None
-        if journal is None:
-            return
-
-        message = self._effective_memory_message(state, update, runtime)
-        if message is None:
-            return
-
-        try:
-            journal.record_memory_context(
-                content_sha256=hashlib.sha256(message.content.encode("utf-8")).hexdigest(),
-            )
-        except Exception:
-            logger.debug("Failed to record effective memory context", exc_info=True)

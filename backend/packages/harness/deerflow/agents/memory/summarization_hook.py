@@ -20,9 +20,16 @@ def memory_flush_hook(event: SummarizationEvent) -> None:
         return
 
     user_id = resolve_runtime_user_id(event.runtime)
+    runtime_context = getattr(event.runtime, "context", None)
+    project_id = runtime_context.get("project_id") if isinstance(runtime_context, dict) and isinstance(runtime_context.get("project_id"), str) else None
+    kwargs = {
+        "agent_name": event.agent_name,
+        "user_id": user_id,
+    }
+    if project_id:
+        kwargs["project_id"] = project_id
     get_memory_manager().add_nowait(
         event.thread_id,
         list(event.messages_to_summarize),
-        agent_name=event.agent_name,
-        user_id=user_id,
+        **kwargs,
     )

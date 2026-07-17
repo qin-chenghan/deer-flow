@@ -52,6 +52,32 @@ class DeerMemConfig(BaseModel):
         default="",
         description="Dotted class path for an alternative storage provider; empty (default) = FileMemoryStorage (no importlib, portable).",
     )
+    strict_user_scope: bool = Field(
+        default=False,
+        description="Require user_id for every storage scope. False preserves no-auth and legacy callers.",
+    )
+    fact_format: Literal["markdown"] = Field(
+        default="markdown",
+        description="Canonical per-fact persistence format. This release supports Markdown with YAML front matter.",
+    )
+    manifest_filename: str = Field(
+        default="memory.json",
+        description="Scope manifest filename. Must be a plain .json filename.",
+    )
+    file_lock_timeout_seconds: int = Field(
+        default=10,
+        ge=1,
+        le=120,
+        description="Maximum wait for the per-scope cross-process advisory file lock.",
+    )
+    journal_enabled: Literal[True] = Field(
+        default=True,
+        description="Multi-file safety journal; fixed on for the Markdown-plus-manifest backend.",
+    )
+    retrieval_adapter: str = Field(
+        default="",
+        description="Optional dotted retrieval-adapter factory. It receives DeerMemConfig and must implement RetrievalPort.",
+    )
     # ── Queue ────────────────────────────────────────────────────────────
     debounce_seconds: int = Field(
         default=30,
@@ -114,39 +140,6 @@ class DeerMemConfig(BaseModel):
     staleness_protected_categories: list[str] = Field(
         default_factory=lambda: ["correction"],
         description="Fact categories exempt from staleness review.",
-    )
-    staleness_max_lifetime_multiplier: float = Field(
-        default=20.0,
-        ge=1.0,
-        le=100.0,
-        description=(
-            "Creation-time cap multiplier for a fact's LLM-assigned "
-            "expected_valid_days. When a new fact is stored, its "
-            "expected_valid_days is clamped to "
-            "staleness_age_days * staleness_max_lifetime_multiplier so the "
-            "model cannot set an initial lifetime so long that the fact is "
-            "never re-evaluated. Default 20.0 (90 x 20 = 1800 d ~= 5 years) "
-            "is generous enough to support the 'very stable' prompt tier "
-            "(core skills, native language) without needing multiple review "
-            "cycles to escape the cap. Lifetime extensions (staleFactsToExtend) "
-            "are subject to staleness_max_extension_days instead."
-        ),
-    )
-    staleness_max_extension_days: int = Field(
-        default=3650,
-        ge=90,
-        le=36500,
-        description=(
-            "Absolute upper bound (in days) on expected_valid_days after a "
-            "lifetime extension (staleFactsToExtend). Applied at write time "
-            "during staleness review: new_evd = min(days_since + extend_by, "
-            "staleness_max_extension_days). Separate from the creation-time "
-            "multiplier cap because extensions are deliberate recalibration "
-            "decisions and are not subject to the staleness_age_days scale. "
-            "The ceiling prevents a single LLM misfire from permanently "
-            "deferring a fact or causing timedelta overflow on the next "
-            "candidate-selection pass. Default 3650 (10 years)."
-        ),
     )
     # ── Memory consolidation ────────────────────────────────────────────
     consolidation_enabled: bool = Field(
@@ -236,16 +229,10 @@ class DeerMemConfig(BaseModel):
         typo (e.g. ``storage_pat`` missing the ``h``) does not silently fall
         back to the default and write memory to an unintended location --
         mirrors the host layer's ``load_memory_config_from_dict`` warning.
-
-        ``None`` values are dropped so they fall back to the field default:
-        YAML renders an empty key (``model:`` with only commented children, as
-        shipped in ``config.example.yaml``) as ``None``, which non-Optional
-        fields like ``model`` would otherwise reject even though omitting the
-        key entirely is valid.
         """
         if not backend_config:
             return cls()
-        known = {k: v for k, v in backend_config.items() if k in cls.model_fields and v is not None}
+        known = {k: v for k, v in backend_config.items() if k in cls.model_fields}
         unknown = sorted(k for k in backend_config if k not in cls.model_fields)
         if unknown:
             logger.warning(

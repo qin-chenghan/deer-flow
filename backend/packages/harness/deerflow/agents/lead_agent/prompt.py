@@ -695,7 +695,7 @@ combined with a FastAPI gateway for REST API access [citation:FastAPI](https://f
 """
 
 
-def _get_memory_context(agent_name: str | None = None, *, app_config: AppConfig | None = None) -> str:
+def _get_memory_context(agent_name: str | None = None, *, app_config: AppConfig | None = None, project_id: str | None = None) -> str:
     """Get memory context for injection into system prompt.
 
     Args:
@@ -723,6 +723,7 @@ def _get_memory_context(agent_name: str | None = None, *, app_config: AppConfig 
         memory_content = get_memory_manager().get_context(
             user_id=get_effective_user_id(),
             agent_name=agent_name,
+            project_id=project_id,
         )
 
         if not memory_content.strip():
@@ -805,16 +806,10 @@ def get_skills_prompt_section(
         try:
             from deerflow.config import get_app_config
 
-            # Rebind so the storage/enabled-skills loads below use this resolved
-            # config too. Reading only container_path here and then letting
-            # get_enabled_skills_for_config(None) fall back to the warm cache
-            # rendered an empty enabled-skills list on a cold start while the
-            # synchronously-loaded disabled section was populated (#4144).
-            app_config = get_app_config()
-            container_base_path = app_config.skills.container_path
-            skill_evolution_enabled = app_config.skill_evolution.enabled
+            config = get_app_config()
+            container_base_path = config.skills.container_path
+            skill_evolution_enabled = config.skill_evolution.enabled
         except Exception:
-            app_config = None
             container_base_path = DEFAULT_SKILLS_CONTAINER_PATH
             skill_evolution_enabled = False
     else:

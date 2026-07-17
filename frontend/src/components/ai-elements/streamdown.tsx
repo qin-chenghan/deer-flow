@@ -3,7 +3,6 @@
 import { Component, type ComponentProps, type ReactNode } from "react";
 import { Streamdown } from "streamdown";
 
-import { stripLeakedSystemTags } from "@/core/streamdown/preprocess";
 import { installClipboardFallback } from "@/core/clipboard";
 
 export type ClipboardSafeStreamdownProps = ComponentProps<typeof Streamdown>;
@@ -58,15 +57,9 @@ export function ClipboardSafeStreamdown({
   children,
   ...props
 }: ClipboardSafeStreamdownProps) {
-  // Strip leaked system-internal tags (<memory>, <system-reminder>, etc.)
-  // that would cause React to log "unrecognized tag" console errors when
-  // the markdown renderer passes them through as raw HTML.
-  const sanitizedChildren =
-    typeof children === "string" ? stripLeakedSystemTags(children) : children;
-
   return (
-    <StreamdownFallbackBoundary raw={sanitizedChildren}>
-      <Streamdown {...props}>{sanitizedChildren}</Streamdown>
+    <StreamdownFallbackBoundary raw={children}>
+      <Streamdown {...props}>{children}</Streamdown>
     </StreamdownFallbackBoundary>
   );
 }

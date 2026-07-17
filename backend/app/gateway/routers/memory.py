@@ -1,6 +1,6 @@
 """Memory API router for retrieving and managing global memory data."""
 
-from typing import Literal
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -36,6 +36,32 @@ def _resolve_memory_user_id(request: Request) -> str:
     return get_effective_user_id()
 
 
+def _resolve_memory_project_id(request: Request) -> str | None:
+    """Resolve the server-issued project id selected for this memory request.
+
+    Project membership enforcement belongs to the host project service. Until
+    that service exists, this route validates only the opaque internal-id
+    shape; callers must not pass display names or filesystem paths.
+    """
+    project_id = getattr(request, "query_params", {}).get("project_id")
+    if not project_id:
+        return None
+    try:
+        get_memory_manager().validate_project_id(project_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid internal project_id.") from exc
+    return project_id
+
+
+def _memory_scope_kwargs(request: Request) -> dict[str, str]:
+    """Build scope kwargs without sending a legacy-breaking ``None`` project."""
+    kwargs = {"user_id": _resolve_memory_user_id(request)}
+    project_id = _resolve_memory_project_id(request)
+    if project_id is not None:
+        kwargs["project_id"] = project_id
+    return kwargs
+
+
 class ContextSection(BaseModel):
     """Model for context sections (user and history)."""
 
@@ -65,16 +91,26 @@ class Fact(BaseModel):
     id: str = Field(..., description="Unique identifier for the fact")
     content: str = Field(..., description="Fact content")
     category: str = Field(default="context", description="Fact category")
+    categoryExtension: str | None = Field(default=None, description="Optional extension category when the core category is 'other'")
+    topics: list[str] | None = Field(default=None, description="Retrieval-oriented topic labels")
     confidence: float = Field(default=0.5, description="Confidence score (0-1)")
     createdAt: str = Field(default="", description="Creation timestamp")
-    source: str = Field(default="unknown", description="Source thread ID")
+    source: str | dict[str, Any] = Field(default="unknown", description="Structured source metadata; legacy thread-id strings remain readable")
     sourceError: str | None = Field(default=None, description="Optional description of the prior mistake or wrong approach")
+    schemaVersion: int | None = Field(default=None, description="Per-fact schema version")
+    status: str | None = Field(default=None, description="Fact lifecycle status")
+    scope: dict[str, str | None] | None = Field(default=None, description="Canonical user/agent/project scope")
+    revision: int | None = Field(default=None, description="Fact optimistic revision")
+    updatedAt: str | None = Field(default=None, description="Last fact update timestamp")
+    consolidatedAt: str | None = None
+    consolidatedFrom: list[str] | None = None
 
 
 class MemoryResponse(BaseModel):
     """Response model for memory data."""
 
     version: str = Field(default="1.0", description="Memory schema version")
+    revision: int | None = Field(default=None, description="Scope manifest revision")
     lastUpdated: str = Field(default="", description="Last update timestamp")
     user: UserContext = Field(default_factory=UserContext)
     history: HistoryContext = Field(default_factory=HistoryContext)
@@ -130,7 +166,6 @@ class MemoryConfigResponse(BaseModel):
     enabled: bool = Field(..., description="Whether the memory mechanism is enabled (call-site gate).")
     mode: Literal["middleware", "tool"] = Field(..., description="Memory operation mode: 'middleware' (passive per-turn LLM summarization) or 'tool' (model calls memory tools directly). Mechanism-level, applies to any backend.")
     injection_enabled: bool = Field(..., description="Whether memory is injected into the system prompt (call-site gate).")
-    shutdown_flush_timeout_seconds: float = Field(..., description="Hard budget (s) to drain pending memory updates on Gateway graceful shutdown; must fit inside the pod's K8s terminationGracePeriodSeconds.")
     manager_class: str = Field(..., description="Active memory backend selector (backend name or dotted path).")
     backend_config: dict = Field(..., description="Backend-private config (self-interpreted by the backend).")
 
@@ -183,7 +218,7 @@ async def get_memory(http_request: Request) -> MemoryResponse:
         }
         ```
     """
-    memory_data = get_memory_manager().get_memory(user_id=_resolve_memory_user_id(http_request))
+    memory_data = get_memory_manager().get_memory(**_memory_scope_kwargs(http_request))
     return MemoryResponse(**memory_data)
 
 
@@ -203,16 +238,16 @@ async def reload_memory(http_request: Request) -> MemoryResponse:
     Returns:
         The reloaded memory data.
     """
-    user_id = _resolve_memory_user_id(http_request)
+    scope_kwargs = _memory_scope_kwargs(http_request)
     manager = get_memory_manager()
     if hasattr(manager, "reload_memory"):
-        memory_data = manager.reload_memory(user_id=user_id)
+        memory_data = manager.reload_memory(**scope_kwargs)
     else:
         # Non-DeerMem backends have no reload concept; return current memory.
         # (Asymmetry vs fact CRUD, which raises 501 when unsupported: reload is a
         # read-only refresh, so degrading to get_memory is safe and still useful;
         # silently no-op'ing a write would hide data loss, so writes fail loud.)
-        memory_data = manager.get_memory(user_id=user_id)
+        memory_data = manager.get_memory(**scope_kwargs)
     return MemoryResponse(**memory_data)
 
 
@@ -226,7 +261,7 @@ async def reload_memory(http_request: Request) -> MemoryResponse:
 async def clear_memory(http_request: Request) -> MemoryResponse:
     """Clear all persisted memory data."""
     try:
-        memory_data = get_memory_manager().clear_memory(user_id=_resolve_memory_user_id(http_request))
+        memory_data = get_memory_manager().clear_memory(**_memory_scope_kwargs(http_request))
     except OSError as exc:
         raise HTTPException(status_code=500, detail="Failed to clear memory data.") from exc
 
@@ -248,7 +283,7 @@ async def create_memory_fact_endpoint(request: FactCreateRequest, http_request: 
             content=request.content,
             category=request.category,
             confidence=request.confidence,
-            user_id=_resolve_memory_user_id(http_request),
+            **_memory_scope_kwargs(http_request),
         )
     except ValueError as exc:
         raise _map_memory_fact_value_error(exc) from exc
@@ -272,7 +307,7 @@ async def delete_memory_fact_endpoint(fact_id: str, http_request: Request) -> Me
     """Delete a single fact from memory by fact id."""
     try:
         delete_fact = _require_capability("delete_fact", label="delete fact")
-        memory_data = delete_fact(fact_id, user_id=_resolve_memory_user_id(http_request))
+        memory_data = delete_fact(fact_id, **_memory_scope_kwargs(http_request))
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=f"Memory fact '{fact_id}' not found.") from exc
     except OSError as exc:
@@ -297,7 +332,7 @@ async def update_memory_fact_endpoint(fact_id: str, request: FactPatchRequest, h
             content=request.content,
             category=request.category,
             confidence=request.confidence,
-            user_id=_resolve_memory_user_id(http_request),
+            **_memory_scope_kwargs(http_request),
         )
     except ValueError as exc:
         raise _map_memory_fact_value_error(exc) from exc
@@ -318,7 +353,7 @@ async def update_memory_fact_endpoint(fact_id: str, request: FactPatchRequest, h
 )
 async def export_memory(http_request: Request) -> MemoryResponse:
     """Export the current memory data."""
-    memory_data = get_memory_manager().get_memory(user_id=_resolve_memory_user_id(http_request))
+    memory_data = get_memory_manager().get_memory(**_memory_scope_kwargs(http_request))
     return MemoryResponse(**memory_data)
 
 
@@ -332,7 +367,7 @@ async def export_memory(http_request: Request) -> MemoryResponse:
 async def import_memory(request: MemoryResponse, http_request: Request) -> MemoryResponse:
     """Import and persist memory data."""
     try:
-        memory_data = get_memory_manager().import_memory(request.model_dump(), user_id=_resolve_memory_user_id(http_request))
+        memory_data = get_memory_manager().import_memory(request.model_dump(exclude_none=True), **_memory_scope_kwargs(http_request))
     except OSError as exc:
         raise HTTPException(status_code=500, detail="Failed to import memory data.") from exc
 
@@ -363,7 +398,6 @@ async def get_memory_config_endpoint() -> MemoryConfigResponse:
         {
             "enabled": true,
             "injection_enabled": true,
-            "shutdown_flush_timeout_seconds": 30.0,
             "mode": "middleware",
             "manager_class": "deermem",
             "backend_config": {
@@ -382,7 +416,6 @@ async def get_memory_config_endpoint() -> MemoryConfigResponse:
         enabled=config.enabled,
         mode=config.mode,
         injection_enabled=config.injection_enabled,
-        shutdown_flush_timeout_seconds=config.shutdown_flush_timeout_seconds,
         manager_class=config.manager_class,
         backend_config=config.backend_config,
     )
@@ -402,14 +435,13 @@ async def get_memory_status(http_request: Request) -> MemoryStatusResponse:
         Combined memory configuration and current data.
     """
     config = get_memory_config()
-    memory_data = get_memory_manager().get_memory(user_id=_resolve_memory_user_id(http_request))
+    memory_data = get_memory_manager().get_memory(**_memory_scope_kwargs(http_request))
 
     return MemoryStatusResponse(
         config=MemoryConfigResponse(
             enabled=config.enabled,
             mode=config.mode,
             injection_enabled=config.injection_enabled,
-            shutdown_flush_timeout_seconds=config.shutdown_flush_timeout_seconds,
             manager_class=config.manager_class,
             backend_config=config.backend_config,
         ),

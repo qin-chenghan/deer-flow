@@ -53,8 +53,8 @@ class _MockManager:
         self._supports_delete = supports_delete
         self.calls = []
 
-    def search(self, query, top_k=5, *, user_id=None, agent_name=None, category=None):
-        self.calls.append(("search", query, top_k, user_id, agent_name, category))
+    def search(self, query, top_k=5, *, user_id=None, agent_name=None, category=None, project_id=None):
+        self.calls.append(("search", query, top_k, user_id, agent_name, category) if project_id is None else ("search", query, top_k, user_id, agent_name, category, project_id))
         if self._raise_on_search:
             raise self._raise_on_search
         # Mirror the real backend: filter by category BEFORE returning, so the
@@ -64,12 +64,12 @@ class _MockManager:
             results = [f for f in results if f.get("category") == category]
         return results
 
-    def get_memory(self, *, user_id=None, agent_name=None):
-        self.calls.append(("get_memory", user_id, agent_name))
+    def get_memory(self, *, user_id=None, agent_name=None, project_id=None):
+        self.calls.append(("get_memory", user_id, agent_name) if project_id is None else ("get_memory", user_id, agent_name, project_id))
         return {"facts": list(self._facts)}
 
-    def create_fact(self, content, category="context", confidence=0.5, *, agent_name=None, user_id=None):
-        self.calls.append(("create_fact", content, category, confidence, agent_name, user_id))
+    def create_fact(self, content, category="context", confidence=0.5, *, agent_name=None, user_id=None, project_id=None):
+        self.calls.append(("create_fact", content, category, confidence, agent_name, user_id) if project_id is None else ("create_fact", content, category, confidence, agent_name, user_id, project_id))
         if self._raise_on_create:
             raise self._raise_on_create
         # Mirrors the real backend: returns (memory_data, fact_id) so the tool uses
@@ -80,14 +80,14 @@ class _MockManager:
         created["confidence"] = confidence
         return {"facts": [created] + list(self._facts)}, created.get("id")
 
-    def update_fact(self, fact_id, content=None, category=None, confidence=None, *, agent_name=None, user_id=None):
-        self.calls.append(("update_fact", fact_id, content, category, confidence, agent_name, user_id))
+    def update_fact(self, fact_id, content=None, category=None, confidence=None, *, agent_name=None, user_id=None, project_id=None):
+        self.calls.append(("update_fact", fact_id, content, category, confidence, agent_name, user_id) if project_id is None else ("update_fact", fact_id, content, category, confidence, agent_name, user_id, project_id))
         if self._raise_on_update:
             raise self._raise_on_update
         return {"facts": []}
 
-    def delete_fact(self, fact_id, *, agent_name=None, user_id=None):
-        self.calls.append(("delete_fact", fact_id, agent_name, user_id))
+    def delete_fact(self, fact_id, *, agent_name=None, user_id=None, project_id=None):
+        self.calls.append(("delete_fact", fact_id, agent_name, user_id) if project_id is None else ("delete_fact", fact_id, agent_name, user_id, project_id))
         if self._raise_on_delete:
             raise self._raise_on_delete
         return {"facts": []}
@@ -255,6 +255,16 @@ class TestMemoryAddTool:
         result = json.loads(result_json)
         assert result["status"] == "added"
         assert captured == {"agent_name": "code-agent", "user_id": "runtime-user"}
+
+    def test_uses_dynamic_internal_project_id(self, monkeypatch):
+        mgr = _install_manager(monkeypatch, _MockManager(facts=[]))
+        runtime = SimpleNamespace(context={"agent_name": "code-agent", "project_id": "prj-internal-1"})
+
+        result = json.loads(memory_add_tool.func(runtime, "Project requires Python 3.12"))
+
+        assert result["status"] == "added"
+        assert ("get_memory", "test-user", "code-agent", "prj-internal-1") in mgr.calls
+        assert any(call[0] == "create_fact" and call[-1] == "prj-internal-1" for call in mgr.calls)
 
     def test_rejects_existing_duplicate_content(self, monkeypatch):
         """Should not create a fact whose normalized content already exists."""
@@ -500,7 +510,8 @@ class TestModeGating:
             "load_agent_config",
             lambda name: SimpleNamespace(model=None, skills=None, tool_groups=None),
         )
-        monkeypatch.setattr(lead_agent_module, "_load_enabled_available_skills", lambda available_skills, *, app_config, user_id=None: [])
+        monkeypatch.setattr(lead_agent_module, "_load_enabled_skills_for_tool_policy", lambda available_skills, *, app_config, user_id=None: [])
+        monkeypatch.setattr(lead_agent_module, "filter_tools_by_skill_allowed_tools", lambda tools, skills, always_allowed_tool_names=(): tools)
         monkeypatch.setattr("deerflow.tools.get_available_tools", lambda **kwargs: [_NamedTool("memory_search"), _NamedTool("bash")])
 
         app_config = SimpleNamespace(
@@ -532,7 +543,8 @@ class TestModeGating:
             "load_agent_config",
             lambda name: SimpleNamespace(model=None, skills=None, tool_groups=None),
         )
-        monkeypatch.setattr(lead_agent_module, "_load_enabled_available_skills", lambda available_skills, *, app_config, user_id=None: [])
+        monkeypatch.setattr(lead_agent_module, "_load_enabled_skills_for_tool_policy", lambda available_skills, *, app_config, user_id=None: [])
+        monkeypatch.setattr(lead_agent_module, "filter_tools_by_skill_allowed_tools", lambda tools, skills, always_allowed_tool_names=(): tools)
         monkeypatch.setattr("deerflow.tools.get_available_tools", lambda **kwargs: [_NamedTool("bash"), _NamedTool("bash")])
 
         app_config = SimpleNamespace(

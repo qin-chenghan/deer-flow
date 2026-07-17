@@ -28,8 +28,8 @@ from deerflow.tools.types import Runtime
 logger = logging.getLogger(__name__)
 
 
-def _resolve_scope(runtime: Runtime | None = None) -> tuple[str | None, str]:
-    """Resolve agent_name and user_id for tool handler scope.
+def _resolve_scope(runtime: Runtime | None = None) -> tuple[str | None, str, str | None]:
+    """Resolve agent_name, user_id, and trusted internal project id.
 
     Tool execution receives user and agent metadata through LangGraph runtime
     context.  Prefer that channel over ContextVar fallback so persistence stays
@@ -39,11 +39,19 @@ def _resolve_scope(runtime: Runtime | None = None) -> tuple[str | None, str]:
     agent_name = None
     if isinstance(context, dict) and context.get("agent_name"):
         agent_name = str(context["agent_name"])
-    return agent_name, resolve_runtime_user_id(runtime)
+    project_id = None
+    if isinstance(context, dict) and isinstance(context.get("project_id"), str) and context["project_id"]:
+        project_id = context["project_id"]
+    return agent_name, resolve_runtime_user_id(runtime), project_id
 
 
 def _memory_content_key(content: str) -> str:
     return content.strip().casefold()
+
+
+def _project_kwargs(project_id: str | None) -> dict[str, str]:
+    """Keep old third-party backend call shapes when no project is selected."""
+    return {"project_id": project_id} if project_id is not None else {}
 
 
 @tool("memory_search", parse_docstring=True)
@@ -69,7 +77,7 @@ def memory_search_tool(
         JSON string with "results" (list of fact objects) and "count".
         Each fact has id, content, category, confidence, createdAt, and source.
     """
-    agent_name, user_id = _resolve_scope(runtime)
+    agent_name, user_id, project_id = _resolve_scope(runtime)
     try:
         results = get_memory_manager().search(
             query,
@@ -77,6 +85,7 @@ def memory_search_tool(
             user_id=user_id,
             agent_name=agent_name,
             category=category,
+            **_project_kwargs(project_id),
         )
         return json.dumps({"results": results, "count": len(results)}, ensure_ascii=False)
     except Exception as exc:
@@ -110,14 +119,14 @@ def memory_add_tool(
         JSON string with "fact_id" and "status": "added".
         On duplicate content, returns "error" with explanation.
     """
-    agent_name, user_id = _resolve_scope(runtime)
+    agent_name, user_id, project_id = _resolve_scope(runtime)
     try:
         normalized_content = content.strip()
         if not normalized_content:
             return json.dumps({"error": "empty content"})
         content_key = _memory_content_key(normalized_content)
         manager = get_memory_manager()
-        existing_facts = manager.get_memory(agent_name=agent_name, user_id=user_id).get("facts", [])
+        existing_facts = manager.get_memory(agent_name=agent_name, user_id=user_id, **_project_kwargs(project_id)).get("facts", [])
         # Tool calls normally run one-at-a-time per user turn. If tool-mode
         # writing broadens to multiple concurrent calls for the same user,
         # move duplicate rejection into the storage/update critical section.
@@ -136,6 +145,7 @@ def memory_add_tool(
             confidence=confidence,
             agent_name=agent_name,
             user_id=user_id,
+            **_project_kwargs(project_id),
         )
         if fact_id is None:
             # max_facts cap kept higher-confidence facts and evicted the new one;
@@ -179,7 +189,7 @@ def memory_update_tool(
         JSON string with "fact_id" and "status": "updated".
         On invalid fact_id, returns "error" with explanation.
     """
-    agent_name, user_id = _resolve_scope(runtime)
+    agent_name, user_id, project_id = _resolve_scope(runtime)
     try:
         manager = get_memory_manager()
         update = getattr(manager, "update_fact", None)
@@ -192,6 +202,7 @@ def memory_update_tool(
             confidence=confidence,
             agent_name=agent_name,
             user_id=user_id,
+            **_project_kwargs(project_id),
         )
         return json.dumps({"fact_id": fact_id, "status": "updated"})
     except KeyError:
@@ -217,13 +228,13 @@ def memory_delete_tool(runtime: Runtime, fact_id: str) -> str:
         JSON string with "fact_id" and "status": "deleted".
         On invalid fact_id, returns "error" with explanation.
     """
-    agent_name, user_id = _resolve_scope(runtime)
+    agent_name, user_id, project_id = _resolve_scope(runtime)
     try:
         manager = get_memory_manager()
         delete = getattr(manager, "delete_fact", None)
         if not callable(delete):
             return json.dumps({"error": f"memory backend {type(manager).__name__} does not support delete_fact"})
-        delete(fact_id, agent_name=agent_name, user_id=user_id)
+        delete(fact_id, agent_name=agent_name, user_id=user_id, **_project_kwargs(project_id))
         return json.dumps({"fact_id": fact_id, "status": "deleted"})
     except KeyError:
         return json.dumps({"error": f"Fact not found: {fact_id}"})

@@ -80,6 +80,7 @@ class NoopMemoryManager(MemoryManager):
         *,
         agent_name: str | None = None,
         user_id: str | None = None,
+        project_id: str | None = None,
         trace_id: str | None = None,
     ) -> None:
         return None
@@ -91,6 +92,7 @@ class NoopMemoryManager(MemoryManager):
         *,
         agent_name: str | None = None,
         user_id: str | None = None,
+        project_id: str | None = None,
     ) -> None:
         return None
 
@@ -101,6 +103,7 @@ class NoopMemoryManager(MemoryManager):
         *,
         agent_name: str | None = None,
         thread_id: str | None = None,
+        project_id: str | None = None,
     ) -> str:
         return ""
 
@@ -112,6 +115,7 @@ class NoopMemoryManager(MemoryManager):
         user_id: str | None = None,
         agent_name: str | None = None,
         category: str | None = None,
+        project_id: str | None = None,
     ) -> list[dict[str, Any]]:
         return []
 
@@ -121,6 +125,7 @@ class NoopMemoryManager(MemoryManager):
         *,
         user_id: str | None = None,
         agent_name: str | None = None,
+        project_id: str | None = None,
     ) -> dict[str, Any]:
         return _empty_memory()
 
@@ -129,6 +134,7 @@ class NoopMemoryManager(MemoryManager):
         *,
         user_id: str | None = None,
         agent_name: str | None = None,
+        project_id: str | None = None,
     ) -> None:
         return None
 
@@ -137,6 +143,7 @@ class NoopMemoryManager(MemoryManager):
         *,
         user_id: str | None = None,
         agent_name: str | None = None,
+        project_id: str | None = None,
     ) -> dict[str, Any]:
         return _empty_memory()
 
@@ -146,6 +153,7 @@ class NoopMemoryManager(MemoryManager):
         *,
         user_id: str | None = None,
         agent_name: str | None = None,
+        project_id: str | None = None,
     ) -> dict[str, Any]:
         return _empty_memory()
 
@@ -154,13 +162,9 @@ class NoopMemoryManager(MemoryManager):
         *,
         user_id: str | None = None,
         agent_name: str | None = None,
+        project_id: str | None = None,
     ) -> dict[str, Any]:
         return _empty_memory()
-
-    # ── Lifecycle ───────────────────────────────────────────────────────
-    def shutdown_flush(self, timeout: float) -> bool:
-        """Nothing is ever queued, so shutdown drain is a clean no-op success."""
-        return True
 
     # ── Optional DeerMem-internal capabilities (NOT on the ABC) ──────────
     # The host gateway discovers these via ``hasattr(manager, "<name>")`` and

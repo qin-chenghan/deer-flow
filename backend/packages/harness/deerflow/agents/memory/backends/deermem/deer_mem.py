@@ -23,6 +23,7 @@ never breaks those modules at import time (see MemoryManager plan, step 8).
 
 from __future__ import annotations
 
+import copy
 import logging
 from typing import Any
 
@@ -71,6 +72,7 @@ class DeerMem(MemoryManager):
         *,
         agent_name: str | None = None,
         user_id: str | None = None,
+        project_id: str | None = None,
         trace_id: str | None = None,
     ) -> None:
         """Filter, validate, detect signals, then enqueue (debounced).
@@ -88,6 +90,7 @@ class DeerMem(MemoryManager):
             messages=filtered,
             agent_name=agent_name,
             user_id=user_id,
+            project_id=project_id,
             trace_id=trace_id,
             correction_detected=correction_detected,
             reinforcement_detected=reinforcement_detected,
@@ -100,6 +103,7 @@ class DeerMem(MemoryManager):
         *,
         agent_name: str | None = None,
         user_id: str | None = None,
+        project_id: str | None = None,
     ) -> None:
         """Filter, validate, detect signals, then enqueue for immediate flush.
 
@@ -115,6 +119,7 @@ class DeerMem(MemoryManager):
             messages=filtered,
             agent_name=agent_name,
             user_id=user_id,
+            project_id=project_id,
             correction_detected=correction_detected,
             reinforcement_detected=reinforcement_detected,
         )
@@ -149,6 +154,7 @@ class DeerMem(MemoryManager):
         *,
         agent_name: str | None = None,
         thread_id: str | None = None,
+        project_id: str | None = None,
     ) -> str:
         """Load memory and format it for injection (plain text, no wrap).
 
@@ -157,7 +163,7 @@ class DeerMem(MemoryManager):
         ``injection_enabled`` gate and the ``<memory>`` wrapping stay at the
         call site (``_get_memory_context``); this returns only the body.
         """
-        memory_data = self._updater.get_memory_data(agent_name=agent_name, user_id=user_id)
+        memory_data = self._updater.get_memory_data(agent_name=agent_name, user_id=user_id, project_id=project_id)
         return format_memory_for_injection(
             memory_data,
             max_tokens=self._config.max_injection_tokens,
@@ -174,6 +180,7 @@ class DeerMem(MemoryManager):
         user_id: str | None = None,
         agent_name: str | None = None,
         category: str | None = None,
+        project_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Case-insensitive substring search over stored facts.
 
@@ -188,7 +195,15 @@ class DeerMem(MemoryManager):
         if not query or not query.strip() or top_k <= 0:
             return []
         query_lower = query.strip().lower()
-        memory_data = self._updater.get_memory_data(agent_name=agent_name, user_id=user_id)
+        scopes = [{"userId": user_id, "agentName": agent_name, "projectId": project_id}]
+        search_facts = getattr(self._storage, "search_facts", None)
+        indexed = search_facts(query, scopes=scopes, top_k=top_k, mode="hybrid", filters={"category": category} if category else None) if callable(search_facts) else []
+        if indexed:
+            return [copy.deepcopy(result.get("fact", result)) for result in indexed]
+        memory_kwargs: dict[str, Any] = {"agent_name": agent_name, "user_id": user_id}
+        if project_id is not None:
+            memory_kwargs["project_id"] = project_id
+        memory_data = self._updater.get_memory_data(**memory_kwargs)
         matched = [fact for fact in memory_data.get("facts", []) if isinstance(fact.get("content"), str) and query_lower in fact["content"].lower() and (category is None or fact.get("category") == category)]
         matched.sort(key=_coerce_source_confidence, reverse=True)
         return matched[:top_k]
@@ -199,14 +214,16 @@ class DeerMem(MemoryManager):
         *,
         user_id: str | None = None,
         agent_name: str | None = None,
+        project_id: str | None = None,
     ) -> dict[str, Any]:
-        return self._updater.get_memory_data(agent_name=agent_name, user_id=user_id)
+        return self._updater.get_memory_data(agent_name=agent_name, user_id=user_id, project_id=project_id)
 
     def delete_memory(
         self,
         *,
         user_id: str | None = None,
         agent_name: str | None = None,
+        project_id: str | None = None,
     ) -> None:
         """Not implemented this phase (storage/updater deletion is a future ``core/`` addition)."""
         raise NotImplementedError("DeerMem.delete_memory is not implemented yet")
@@ -216,8 +233,9 @@ class DeerMem(MemoryManager):
         *,
         user_id: str | None = None,
         agent_name: str | None = None,
+        project_id: str | None = None,
     ) -> dict[str, Any]:
-        return self._updater.clear_memory_data(agent_name=agent_name, user_id=user_id)
+        return self._updater.clear_memory_data(agent_name=agent_name, user_id=user_id, project_id=project_id)
 
     def import_memory(
         self,
@@ -225,30 +243,19 @@ class DeerMem(MemoryManager):
         *,
         user_id: str | None = None,
         agent_name: str | None = None,
+        project_id: str | None = None,
     ) -> dict[str, Any]:
-        return self._updater.import_memory_data(memory_data, agent_name=agent_name, user_id=user_id)
+        return self._updater.import_memory_data(memory_data, agent_name=agent_name, user_id=user_id, project_id=project_id)
 
     def export_memory(
         self,
         *,
         user_id: str | None = None,
         agent_name: str | None = None,
+        project_id: str | None = None,
     ) -> dict[str, Any]:
         """Not implemented this phase (no distinct export yet; /export routes via get_memory)."""
         raise NotImplementedError("DeerMem.export_memory is not implemented yet")
-
-    # ── Lifecycle ───────────────────────────────────────────────────────
-    def shutdown_flush(self, timeout: float) -> bool:
-        """Drain the debounce queue within ``timeout`` on graceful shutdown.
-
-        Delegates to the queue's bounded synchronous flush, which joins an
-        in-flight worker first (so contexts a debounce Timer already pulled out
-        of the queue are not lost on exit) and otherwise drains the queue on a
-        daemon thread with a real hard timeout (the memory-update LLM call is
-        synchronous and cannot be interrupted). Returns ``True`` only when the
-        drain genuinely finished within ``timeout``.
-        """
-        return self._queue.flush_sync(timeout)
 
     # ── DeerMem-internal (NOT on the ABC; reached via hasattr probing) ───
     def warm(self) -> bool:
@@ -271,9 +278,10 @@ class DeerMem(MemoryManager):
         *,
         user_id: str | None = None,
         agent_name: str | None = None,
+        project_id: str | None = None,
     ) -> dict[str, Any]:
         """Drop the cached memory document and reload from disk."""
-        return self._updater.reload_memory_data(agent_name=agent_name, user_id=user_id)
+        return self._updater.reload_memory_data(agent_name=agent_name, user_id=user_id, project_id=project_id)
 
     def create_fact(
         self,
@@ -283,6 +291,7 @@ class DeerMem(MemoryManager):
         *,
         agent_name: str | None = None,
         user_id: str | None = None,
+        project_id: str | None = None,
     ) -> tuple[dict[str, Any], str | None]:
         return self._updater.create_memory_fact(
             content,
@@ -290,6 +299,7 @@ class DeerMem(MemoryManager):
             confidence=confidence,
             agent_name=agent_name,
             user_id=user_id,
+            project_id=project_id,
         )
 
     def delete_fact(
@@ -298,8 +308,9 @@ class DeerMem(MemoryManager):
         *,
         agent_name: str | None = None,
         user_id: str | None = None,
+        project_id: str | None = None,
     ) -> dict[str, Any]:
-        return self._updater.delete_memory_fact(fact_id, agent_name=agent_name, user_id=user_id)
+        return self._updater.delete_memory_fact(fact_id, agent_name=agent_name, user_id=user_id, project_id=project_id)
 
     def update_fact(
         self,
@@ -310,6 +321,7 @@ class DeerMem(MemoryManager):
         *,
         agent_name: str | None = None,
         user_id: str | None = None,
+        project_id: str | None = None,
     ) -> dict[str, Any]:
         return self._updater.update_memory_fact(
             fact_id,
@@ -318,4 +330,5 @@ class DeerMem(MemoryManager):
             confidence=confidence,
             agent_name=agent_name,
             user_id=user_id,
+            project_id=project_id,
         )

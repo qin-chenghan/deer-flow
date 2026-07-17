@@ -12,13 +12,11 @@ const katexOptions = {
   strict: false,
 } as const;
 
-const sharedRemarkPlugins = [
-  [remarkGfm, { singleTilde: false }],
-  [remarkMath, { singleDollarTextMath: true }],
-] as StreamdownProps["remarkPlugins"];
-
 export const streamdownPlugins = {
-  remarkPlugins: sharedRemarkPlugins,
+  remarkPlugins: [
+    remarkGfm,
+    [remarkMath, { singleDollarTextMath: true }],
+  ] as StreamdownProps["remarkPlugins"],
   rehypePlugins: [
     rehypeRaw,
     [rehypeKatex, katexOptions],
@@ -26,7 +24,10 @@ export const streamdownPlugins = {
 };
 
 export const streamdownPluginsWithWordAnimation = {
-  remarkPlugins: sharedRemarkPlugins,
+  remarkPlugins: [
+    remarkGfm,
+    [remarkMath, { singleDollarTextMath: true }],
+  ] as StreamdownProps["remarkPlugins"],
   rehypePlugins: [
     [rehypeKatex, katexOptions],
     rehypeSplitWordsIntoSpans,

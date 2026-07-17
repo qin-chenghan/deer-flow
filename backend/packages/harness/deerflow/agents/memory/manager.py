@@ -19,6 +19,7 @@ from __future__ import annotations
 import importlib
 import logging
 import os
+import re
 import threading
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -33,6 +34,7 @@ logger = logging.getLogger(__name__)
 _BACKENDS_DIR = Path(__file__).parent / "backends"
 # Sentinel attribute each backend's __init__ exposes (a MemoryManager subclass).
 _MANAGER_CLASS_ATTR = "MANAGER_CLASS"
+_DEFAULT_PROJECT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 
 # Singleton instance + backend-registry cache (reset together by reset_memory_manager).
 # _manager_lock guards get_memory_manager()'s double-checked init (multi-threaded).
@@ -44,8 +46,9 @@ _manager_lock = threading.Lock()
 class MemoryManager(ABC):
     """Backend-neutral memory manager contract (9 methods).
 
-    Memories are bucketed per ``(agent_name, user_id)``; ``thread_id`` aligns
-    with the deer-flow conversation thread. The contract is deliberately
+    Memories are bucketed per ``(user_id, agent_name, project_id)``;
+    ``thread_id`` records the source conversation but is not a long-term
+    storage bucket. The contract is deliberately
     neutral so a third-party memory system can be adapted without deer-flow
     code changes:
 
@@ -72,6 +75,17 @@ class MemoryManager(ABC):
         """
         self._backend_config = backend_config
 
+    def validate_project_id(self, project_id: str) -> None:
+        """Validate a host-provided project scope identifier.
+
+        The default contract accepts opaque, path-safe internal IDs. A memory
+        plugin may override this when its project-key rules are stricter. Host
+        code must call this manager boundary instead of importing backend
+        storage/path helpers.
+        """
+        if not project_id or not _DEFAULT_PROJECT_ID_PATTERN.fullmatch(project_id):
+            raise ValueError("project_id must contain only letters, numbers, '_' and '-'.")
+
     # ── Write ────────────────────────────────────────────────────────────
     @abstractmethod
     def add(
@@ -81,6 +95,7 @@ class MemoryManager(ABC):
         *,
         agent_name: str | None = None,
         user_id: str | None = None,
+        project_id: str | None = None,
         trace_id: str | None = None,
     ) -> None:
         """Queue a conversation for memory update (debounced, asynchronous).
@@ -102,6 +117,7 @@ class MemoryManager(ABC):
         *,
         agent_name: str | None = None,
         user_id: str | None = None,
+        project_id: str | None = None,
     ) -> None:
         """Queue a conversation for *immediate* memory update (emergency flush).
 
@@ -117,6 +133,7 @@ class MemoryManager(ABC):
         *,
         agent_name: str | None = None,
         thread_id: str | None = None,
+        project_id: str | None = None,
     ) -> str:
         """Return injection-ready memory text for the given bucket.
 
@@ -135,6 +152,7 @@ class MemoryManager(ABC):
         user_id: str | None = None,
         agent_name: str | None = None,
         category: str | None = None,
+        project_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Search the bucket's memory for facts matching ``query``; return up to
         ``top_k`` ranked by relevance. ``category`` (optional) filters BEFORE the
@@ -148,6 +166,7 @@ class MemoryManager(ABC):
         *,
         user_id: str | None = None,
         agent_name: str | None = None,
+        project_id: str | None = None,
     ) -> dict[str, Any]:
         """Return the full memory document for the bucket."""
 
@@ -157,6 +176,7 @@ class MemoryManager(ABC):
         *,
         user_id: str | None = None,
         agent_name: str | None = None,
+        project_id: str | None = None,
     ) -> None:
         """Delete the entire memory document for the bucket. *stub* this phase."""
 
@@ -166,6 +186,7 @@ class MemoryManager(ABC):
         *,
         user_id: str | None = None,
         agent_name: str | None = None,
+        project_id: str | None = None,
     ) -> dict[str, Any]:
         """Clear the bucket's memory; return the cleared (now-empty) document."""
 
@@ -176,6 +197,7 @@ class MemoryManager(ABC):
         *,
         user_id: str | None = None,
         agent_name: str | None = None,
+        project_id: str | None = None,
     ) -> dict[str, Any]:
         """Import a memory document into the bucket; return the merged result."""
 
@@ -185,36 +207,9 @@ class MemoryManager(ABC):
         *,
         user_id: str | None = None,
         agent_name: str | None = None,
+        project_id: str | None = None,
     ) -> dict[str, Any]:
         """Export the memory document for the bucket. *stub* this phase (no caller yet)."""
-
-    # ── Lifecycle ───────────────────────────────────────────────────────
-    @abstractmethod
-    def shutdown_flush(self, timeout: float) -> bool:
-        """Best-effort bounded drain of pending updates on graceful shutdown.
-
-        Runs on the Gateway shutdown path (after IM channels and the scheduler
-        stop, so no new IM/scheduler updates arrive during the drain) to flush
-        updates still sitting in the backend's debounce buffer. Without it, any
-        update enqueued since the last timer fire is lost on restart / rolling
-        deploy / SIGTERM, because the buffer is pure in-memory and the debounce
-        worker is a daemon thread killed on process exit.
-
-        Implementations must honour a *hard* ``timeout``: the drain makes a
-        synchronous LLM call that cannot be interrupted, so the caller (the
-        Gateway lifespan) needs a real upper bound that lines up with the K8s
-        ``terminationGracePeriodSeconds`` (the drain must finish inside the pod
-        grace window, or K8s SIGKILLs it mid-drain and the loss the drain is
-        fixing is silently re-introduced).
-
-        Returns ``True`` if the drain genuinely finished within ``timeout``
-        (buffer empty, no worker still running, no exception); ``False`` on
-        timeout or failure (the caller logs a warning and proceeds to exit --
-        any unfinished tail is dropped, strictly better than no flush). A
-        backend with no pending work (or no buffer at all) returns ``True``
-        immediately, so the host may call this unconditionally when memory is
-        enabled without gating on backend-private queue state.
-        """
 
 
 # ── Backend discovery (drop-in) ───────────────────────────────────────────

@@ -409,6 +409,7 @@ class SubagentExecutor:
         oauth_id: str | None = None,
         run_id: str | None = None,
         channel_user_id: str | None = None,
+        project_id: str | None = None,
         deerflow_trace_id: str | None = None,
     ):
         """Initialize the executor.
@@ -460,6 +461,7 @@ class SubagentExecutor:
         # chats share one thread across senders, so delegated bash commands
         # must export the dispatching turn's id, not none at all.
         self.channel_user_id = channel_user_id
+        self.project_id = project_id
         self.deerflow_trace_id = deerflow_trace_id
 
         self._base_tools = _filter_tools(
@@ -728,11 +730,7 @@ class SubagentExecutor:
             collector_caller = f"subagent:{self.config.name}"
             collector = SubagentTokenCollector(caller=collector_caller)
 
-            # Do not put checkpoint coordinates (thread_id/checkpoint_ns/etc.)
-            # in the child config. LangGraph inherits those coordinates from
-            # the ambient parent run so this execution keeps its subgraph
-            # namespace. Business consumers receive thread_id via ``context``
-            # below instead.
+            # Build config with thread_id for sandbox access and recursion limit
             run_config: RunnableConfig = {
                 "recursion_limit": self.config.max_turns,
                 "callbacks": [collector],
@@ -771,6 +769,7 @@ class SubagentExecutor:
 
             context: dict[str, Any] = {}
             if self.thread_id:
+                run_config["configurable"] = {"thread_id": self.thread_id}
                 context["thread_id"] = self.thread_id
             if self.app_config is not None:
                 context["app_config"] = self.app_config
@@ -785,6 +784,8 @@ class SubagentExecutor:
             context["run_id"] = self.run_id
             if self.channel_user_id:
                 context["channel_user_id"] = self.channel_user_id
+            if self.project_id:
+                context["project_id"] = self.project_id
             if self.deerflow_trace_id:
                 context[DEERFLOW_TRACE_METADATA_KEY] = self.deerflow_trace_id
             context["is_subagent"] = True

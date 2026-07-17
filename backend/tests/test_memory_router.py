@@ -26,6 +26,35 @@ def _sample_memory(facts: list[dict] | None = None) -> dict:
     }
 
 
+def test_project_id_validation_uses_memory_manager_contract() -> None:
+    app = FastAPI()
+    app.include_router(memory.router)
+    mock_mgr = MagicMock()
+    mock_mgr.get_memory.return_value = _sample_memory()
+
+    with patch("app.gateway.routers.memory.get_memory_manager", return_value=mock_mgr):
+        with TestClient(app) as client:
+            response = client.get("/api/memory?project_id=project_internal_1")
+
+    assert response.status_code == 200
+    mock_mgr.validate_project_id.assert_called_once_with("project_internal_1")
+    assert mock_mgr.get_memory.call_args.kwargs["project_id"] == "project_internal_1"
+
+
+def test_project_id_rejected_by_memory_manager_returns_400() -> None:
+    app = FastAPI()
+    app.include_router(memory.router)
+    mock_mgr = MagicMock()
+    mock_mgr.validate_project_id.side_effect = ValueError("plugin-specific project id rule")
+
+    with patch("app.gateway.routers.memory.get_memory_manager", return_value=mock_mgr):
+        with TestClient(app) as client:
+            response = client.get("/api/memory?project_id=not-accepted")
+
+    assert response.status_code == 400
+    mock_mgr.get_memory.assert_not_called()
+
+
 # ── export ─────────────────────────────────────────────────────────────────
 
 

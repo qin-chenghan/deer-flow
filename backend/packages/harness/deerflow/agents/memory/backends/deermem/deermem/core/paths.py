@@ -31,6 +31,7 @@ _SAFE_USER_ID_DIGEST_HEX_LEN = 16
 
 # agent_name validation (inlined; was deer-flow's AGENT_NAME_PATTERN).
 AGENT_NAME_PATTERN = re.compile(r"^[A-Za-z0-9-]+$")
+PROJECT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 def safe_user_id(raw: str) -> str:
@@ -58,6 +59,14 @@ def validate_agent_name(name: str) -> None:
         raise ValueError(f"Invalid agent name {name!r}: names must match {AGENT_NAME_PATTERN.pattern}")
 
 
+def validate_project_id(project_id: str) -> None:
+    """Validate the trusted internal project id used for storage bucketing."""
+    if not project_id:
+        raise ValueError("Project id must be a non-empty string.")
+    if not PROJECT_ID_PATTERN.fullmatch(project_id):
+        raise ValueError(f"Invalid project id {project_id!r}: ids must match {PROJECT_ID_PATTERN.pattern}")
+
+
 def _default_root() -> Path:
     """DeerMem's default data root: ``$DEERMEM_DATA_DIR`` or ``~/.deermem/``."""
     env = os.environ.get("DEERMEM_DATA_DIR")
@@ -71,6 +80,7 @@ def memory_file_path(
     agent_name: str | None = None,
     *,
     user_id: str | None = None,
+    project_id: str | None = None,
 ) -> Path:
     """Resolve the memory file path under DeerMem's own data root.
 
@@ -81,15 +91,38 @@ def memory_file_path(
     ``{base_dir}/users/{user_id}/memory.json`` (CWD-independent).
     """
     root = Path(config.storage_path) if config.storage_path else _default_root()
+    if config.strict_user_scope and user_id is None:
+        raise ValueError("user_id is required when strict_user_scope is enabled.")
+    manifest_filename = config.manifest_filename
+    if Path(manifest_filename).name != manifest_filename or not manifest_filename.endswith(".json"):
+        raise ValueError("manifest_filename must be a plain .json filename.")
 
     if user_id is not None:
         uid = safe_user_id(user_id)
         if agent_name is not None:
             validate_agent_name(agent_name)
-            return root / "users" / uid / "agents" / agent_name.lower() / "memory.json"
-        return root / "users" / uid / "memory.json"
+            bucket = root / "users" / uid / "agents" / agent_name.lower()
+        else:
+            bucket = root / "users" / uid
+        if project_id is not None:
+            validate_project_id(project_id)
+            bucket = bucket / "projects" / project_id
+        return bucket / manifest_filename
     # Legacy: no user_id
     if agent_name is not None:
         validate_agent_name(agent_name)
-        return root / "agents" / agent_name.lower() / "memory.json"
-    return root / "memory.json"
+        bucket = root / "agents" / agent_name.lower()
+    else:
+        bucket = root
+    if project_id is not None:
+        validate_project_id(project_id)
+        bucket = bucket / "projects" / project_id
+    return bucket / manifest_filename
+
+
+def fact_file_path(manifest_path: Path, fact_id: str) -> Path:
+    """Return the sharded Markdown path for a fact under a scope bucket."""
+    if not fact_id or not re.fullmatch(r"[A-Za-z0-9_-]+", fact_id):
+        raise ValueError("Fact id may contain only letters, numbers, '_' and '-'.")
+    prefix = fact_id[:2].lower() if len(fact_id) >= 2 else "__"
+    return manifest_path.parent / "facts" / prefix / f"{fact_id}.md"
