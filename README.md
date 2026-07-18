@@ -783,6 +783,8 @@ Memory updates now skip duplicate fact entries at apply time, so repeated prefer
 
 File-backed memory now separates global user context from agent facts. Each user has one `memory.json` containing only the project-independent `user` and `history` summaries; every fact is a canonical Markdown file below `agents/{agent_name}/facts/`. Runtime/API readers still receive a compatibility `facts` array (empty for the global user view), so the frontend does not read agent facts from `memory.json`. Journaled writes, a shared user lock, and optimistic user-memory revisions prevent silent lost updates. Retrieval engines remain optional behind the memory retrieval-adapter contract, with an explicit local substring fallback when no adapter is configured.
 
+Single-fact repository operations are genuinely incremental: an upsert/delete reads, journals, writes, and re-indexes only the addressed fact files. Fact-level revisions allow bounded rebasing when another agent changed a disjoint fact under the same user revision, while stale writes to the same fact still fail. Full-document `save()` remains a compatibility API and computes a diff before writing; malformed or missing `facts` can no longer silently erase an agent's Markdown files. Legacy fact migration is explicit for unowned global facts, lock-protected, merge-safe, and rejects same-ID conflicts.
+
 ## Recommended Models
 
 DeerFlow is model-agnostic — it works with any LLM that implements the OpenAI-compatible API. That said, it performs best with models that support:

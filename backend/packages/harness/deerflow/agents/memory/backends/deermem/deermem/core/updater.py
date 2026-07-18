@@ -652,6 +652,20 @@ class MemoryUpdater:
             }
         )
         updated_memory["facts"] = _trim_facts_to_max(facts, self._config.max_facts)
+        if getattr(type(self._storage), "apply_changes", None) is not MemoryStorage.apply_changes:
+            stored = any(f.get("id") == fact_id for f in updated_memory["facts"])
+            kept_ids = {str(fact.get("id")) for fact in updated_memory["facts"]}
+            result = self._storage.apply_changes(
+                {
+                    "upserts": [fact for fact in updated_memory["facts"] if fact.get("id") == fact_id],
+                    "deletes": [str(fact.get("id")) for fact in memory_data.get("facts", []) if str(fact.get("id")) not in kept_ids],
+                    "deleteRevisions": {str(fact.get("id")): int(fact.get("revision") or 1) for fact in memory_data.get("facts", []) if str(fact.get("id")) not in kept_ids},
+                },
+                agent_name=agent_name,
+                user_id=user_id,
+                expected_manifest_revision=int(memory_data.get("revision") or 0),
+            )
+            return result, (fact_id if stored else None)
         if not self._save_memory_to_file(updated_memory, agent_name, user_id=user_id, expected_revision=int(memory_data.get("revision") or 0)):
             raise OSError("Failed to save memory data after creating fact")
         # If the cap evicted the just-added (lower-confidence) fact, signal via
@@ -663,11 +677,30 @@ class MemoryUpdater:
         """Delete a fact by its id and persist the updated memory data."""
         if agent_name is None:
             raise ValueError("agent_name")
+        if getattr(type(self._storage), "apply_changes", None) is not MemoryStorage.apply_changes and hasattr(self._storage, "get_fact"):
+            deleted = self._storage.get_fact(fact_id, agent_name=agent_name, user_id=user_id)
+            if deleted is None:
+                raise KeyError(fact_id)
+            global_memory = self.get_memory_data(user_id=user_id)
+            return self._storage.apply_changes(
+                {"deletes": [fact_id], "deleteRevisions": {fact_id: int(deleted.get("revision") or 1)}},
+                agent_name=agent_name,
+                user_id=user_id,
+                expected_manifest_revision=int(global_memory.get("revision") or 0),
+            )
         memory_data = self.get_memory_data(agent_name, user_id=user_id)
         facts = memory_data.get("facts", [])
         updated_facts = [fact for fact in facts if fact.get("id") != fact_id]
         if len(updated_facts) == len(facts):
             raise KeyError(fact_id)
+        deleted = next(fact for fact in facts if fact.get("id") == fact_id)
+        if getattr(type(self._storage), "apply_changes", None) is not MemoryStorage.apply_changes:
+            return self._storage.apply_changes(
+                {"deletes": [fact_id], "deleteRevisions": {fact_id: int(deleted.get("revision") or 1)}},
+                agent_name=agent_name,
+                user_id=user_id,
+                expected_manifest_revision=int(memory_data.get("revision") or 0),
+            )
         updated_memory = dict(memory_data)
         updated_memory["facts"] = updated_facts
         if not self._save_memory_to_file(updated_memory, agent_name, user_id=user_id, expected_revision=int(memory_data.get("revision") or 0)):
@@ -678,6 +711,26 @@ class MemoryUpdater:
         """Update an existing fact and persist the updated memory data."""
         if agent_name is None:
             raise ValueError("agent_name")
+        if getattr(type(self._storage), "apply_changes", None) is not MemoryStorage.apply_changes and hasattr(self._storage, "get_fact"):
+            updated_fact = self._storage.get_fact(fact_id, agent_name=agent_name, user_id=user_id)
+            if updated_fact is None:
+                raise KeyError(fact_id)
+            if content is not None:
+                normalized_content = content.strip()
+                if not normalized_content:
+                    raise ValueError("content")
+                updated_fact["content"] = normalized_content
+            if category is not None:
+                updated_fact["category"] = category.strip() or "context"
+            if confidence is not None:
+                updated_fact["confidence"] = _validate_confidence(confidence)
+            global_memory = self.get_memory_data(user_id=user_id)
+            return self._storage.apply_changes(
+                {"upserts": [updated_fact]},
+                agent_name=agent_name,
+                user_id=user_id,
+                expected_manifest_revision=int(global_memory.get("revision") or 0),
+            )
         memory_data = self.get_memory_data(agent_name, user_id=user_id)
         updated_memory = dict(memory_data)
         updated_facts: list[dict[str, Any]] = []
@@ -700,6 +753,14 @@ class MemoryUpdater:
                 updated_facts.append(fact)
         if not found:
             raise KeyError(fact_id)
+        if getattr(type(self._storage), "apply_changes", None) is not MemoryStorage.apply_changes:
+            changed = next(fact for fact in updated_facts if fact.get("id") == fact_id)
+            return self._storage.apply_changes(
+                {"upserts": [changed]},
+                agent_name=agent_name,
+                user_id=user_id,
+                expected_manifest_revision=int(memory_data.get("revision") or 0),
+            )
         updated_memory["facts"] = updated_facts
         if not self._save_memory_to_file(updated_memory, agent_name, user_id=user_id, expected_revision=int(memory_data.get("revision") or 0)):
             raise OSError(f"Failed to save memory data after updating fact '{fact_id}'")
@@ -800,11 +861,13 @@ class MemoryUpdater:
             change_set = {
                 "upserts": [copy.deepcopy(fact) for fact_id, fact in updated_by_id.items() if current_by_id.get(fact_id) != fact] if agent_name is not None else [],
                 "deletes": [fact_id for fact_id in current_by_id if fact_id not in updated_by_id] if agent_name is not None else [],
-                "summaries": {
+                "deleteRevisions": {fact_id: int(current_by_id[fact_id].get("revision") or 1) for fact_id in current_by_id if fact_id not in updated_by_id} if agent_name is not None else {},
+            }
+            if agent_name is None:
+                change_set["summaries"] = {
                     "user": copy.deepcopy(updated_memory.get("user", {})),
                     "history": copy.deepcopy(updated_memory.get("history", {})),
-                },
-            }
+                }
             self._storage.apply_changes(
                 change_set,
                 agent_name=agent_name,

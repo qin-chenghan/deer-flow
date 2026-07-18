@@ -618,3 +618,32 @@ git diff --check：通过
 ```
 
 测试数从上一版的 337 增加到 340，是因为新增了“单 user JSON + agent facts”“agent 不覆盖 global summaries”和“旧 per-agent JSON 迁移”等场景。
+# 2026-07-18：第一、二批可靠性修复
+
+本轮不是只把 fact “拆成多个文件”，而是把单条 fact 的实际处理链路也改成增量操作：
+
+- `apply_changes()`、`upsert_fact()`、`delete_fact()` 不再执行“加载全部 facts → 修改列表 → 全量 save”。它们只定位目标 ID 对应的 Markdown，journal 也只备份目标旧文件，随后只写入或删除目标文件，并且只向 retrieval 通知发生变化的 ID。
+- 增加回归测试，直接把 `_load_agent_facts()` 替换为一个会报错的函数；单条更新仍能成功，证明增量路径没有暗中扫描全部 fact 文件。
+- 兼容接口 `save()` 仍是“用完整集合替换”的语义，所以必须扫描目录计算删除集合；但它现在先做 diff，未变化 fact 不备份、不重写、也不重复触发索引。Agent 全量保存若缺少 `facts`，或列表含有非对象值，会整体失败并保留旧数据。
+- fact schema 现在严格检查 `content/category/topics/confidence/status/source/createdAt/updatedAt/revision/consolidatedFrom` 等核心字段。系统只支持 `active + 物理删除`，因此其他 status 会被明确拒绝，不再悄悄重新激活。
+- 每条 fact 拥有独立 revision。内容真正变化时保留 `createdAt`、递增 revision、刷新 `updatedAt`；相同内容是 no-op。共享的 user revision 发生冲突时，fact-only change set 最多重试三次；若目标 fact revision 未变，可安全合并不同 agent/不同 fact 的并发更新，若同一 fact 已变化则拒绝陈旧覆盖。
+- 旧 per-agent `memory.json` 的迁移被放进同一把进程内锁和跨进程文件锁。迁移会合并已存在的 Markdown；同 ID 不同内容明确报 `migration conflict`，不会覆盖或删除任一版本。旧全局 JSON 中归属不明的非空 facts 不再由“第一个访问的 agent”自动认领，只能显式指定 agent 执行 `migrate()`。
+- 读取 fact 时同时核对文件名 ID、user scope 和 agent scope；legacy manifest 与 journal 中保存的相对路径都必须解析在用户目录内，禁止 `..` 或绝对路径逃逸。
+- `rebuild_index()` 按单条 fact 捕获 retrieval adapter 的普通异常，一条索引失败只增加 `failed`，不会中断其余重建。
+- Windows `.memory.lock` 只在空文件时写入一个占位字节，不再每次加锁都增长；迁移报告也会正确反映 per-agent legacy 文件是否实际迁移。
+
+运行轨迹（单条更新）如下：
+
+```text
+调用 update/upsert
+  → 由 fact_id 计算唯一 Markdown 路径
+  → 在 user 锁内读取该目标文件
+  → 校验 scope 与 fact revision
+  → 只备份该目标旧文件 + memory.json
+  → 只写该 fact.md
+  → 更新 user-level memory.json revision
+  → journal 标记 committed 并清理恢复文件
+  → 只通知 retrieval 这一个 fact_id
+```
+
+注意：retrieval 的持久化 outbox、缓存容量淘汰，以及自定义 storage/retrieval 工厂契约不属于这两批修复，后续应独立设计，避免把索引一致性和本次文件存储 PR 混在一起。

@@ -229,7 +229,7 @@ def test_per_user_memory_path_matches_host_safe_user_id(deermem_data_dir):
     user_id = "test-user-123@example.com"
     # storage_path mirrors what the host factory injects (runtime_home / base_dir)
     dm = DeerMem(backend_config={"storage_path": str(deermem_data_dir)})
-    dm.create_fact("User prefers concise answers", category="preference", user_id=user_id)
+    dm.create_fact("User prefers concise answers", category="preference", agent_name="default", user_id=user_id)
 
     expected_safe = make_safe_user_id(user_id)
     expected_file = deermem_data_dir / "users" / expected_safe / "memory.json"

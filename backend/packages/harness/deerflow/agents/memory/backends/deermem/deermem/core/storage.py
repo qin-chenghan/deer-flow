@@ -16,7 +16,6 @@ import hashlib
 import importlib
 import json
 import logging
-import math
 import os
 import shutil
 import threading
@@ -103,28 +102,62 @@ def _file_signature(path: Path) -> tuple[int, int] | None:
 
 
 def _normalize_category(fact: dict[str, Any]) -> None:
-    category = str(fact.get("category") or "context")
+    raw_category = fact.get("category", "context")
+    if not isinstance(raw_category, str):
+        raise ValueError("fact.category must be a string")
+    category = raw_category or "context"
     if category not in CORE_CATEGORIES:
         fact.setdefault("categoryExtension", category)
         fact["category"] = "other"
 
 
-def _normalize_fact(fact: dict[str, Any], *, scope: dict[str, str | None]) -> dict[str, Any]:
+def _require_string_list(fact: dict[str, Any], field: str) -> None:
+    value = fact.get(field, [])
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise ValueError(f"fact.{field} must be a list of strings")
+    fact[field] = value
+
+
+def _normalize_fact(
+    fact: dict[str, Any],
+    *,
+    scope: dict[str, str | None],
+    existing: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Validate one fact and derive its per-item revision.
+
+    The shared JSON revision protects the multi-file transaction.  The fact's
+    own revision protects one Markdown object when a disjoint transaction is
+    safely rebased after that shared revision changed.
+    """
+    if not isinstance(fact, dict):
+        raise ValueError("fact must be an object")
     normalized = copy.deepcopy(fact)
     normalized["id"] = str(normalized.get("id") or f"fact_{uuid.uuid4().hex}")
+    # Validate the id through the canonical path builder's public contract.
+    if not normalized["id"] or any(character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-" for character in normalized["id"]):
+        raise ValueError("fact.id may contain only letters, numbers, '_' and '-'")
     normalized["schemaVersion"] = 2
-    normalized["content"] = str(normalized.get("content") or "").strip()
+    if not isinstance(normalized.get("content"), str):
+        raise ValueError("fact.content must be a string")
+    normalized["content"] = normalized["content"].strip()
+    if not normalized["content"]:
+        raise ValueError("fact.content must not be empty")
     _normalize_category(normalized)
-    try:
-        confidence = float(normalized.get("confidence", 0.5))
-    except (TypeError, ValueError):
-        confidence = 0.5
-    normalized["confidence"] = confidence if math.isfinite(confidence) and 0 <= confidence <= 1 else 0.5
+    confidence = normalized.get("confidence", 0.5)
+    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not 0 <= confidence <= 1:
+        raise ValueError("fact.confidence must be a number between 0 and 1")
+    normalized["confidence"] = float(confidence)
+    status = normalized.get("status", "active")
+    if status != "active":
+        raise ValueError("fact.status must be 'active'; deletion is physical")
     normalized["status"] = "active"
     normalized["scope"] = copy.deepcopy(scope)
-    normalized.setdefault("createdAt", utc_now_iso_z())
-    normalized.setdefault("updatedAt", normalized["createdAt"])
-    normalized["revision"] = max(1, int(normalized.get("revision") or 1))
+    _require_string_list(normalized, "topics")
+    _require_string_list(normalized, "consolidatedFrom")
+    revision = normalized.get("revision", 1)
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+        raise ValueError("fact.revision must be an integer >= 1")
     source = normalized.get("source")
     if isinstance(source, str):
         if source in {"manual", "consolidation", "import", "unknown"}:
@@ -135,11 +168,51 @@ def _normalize_fact(fact: dict[str, Any], *, scope: dict[str, str | None]) -> di
         normalized["source"] = {"type": "unknown", "threadId": None}
     else:
         normalized["source"].setdefault("type", "unknown")
-    normalized.setdefault("topics", [])
-    normalized.setdefault("consolidatedFrom", [])
+        if not isinstance(normalized["source"].get("type"), str):
+            raise ValueError("fact.source.type must be a string")
+        if normalized["source"].get("threadId") is not None and not isinstance(normalized["source"].get("threadId"), str):
+            raise ValueError("fact.source.threadId must be a string or null")
+    normalized["title"] = _fact_title(normalized)
+    now = utc_now_iso_z()
+    if existing is None:
+        normalized.setdefault("createdAt", now)
+        normalized.setdefault("updatedAt", normalized["createdAt"])
+        normalized["revision"] = revision
+    else:
+        existing_revision = existing.get("revision")
+        if not isinstance(existing_revision, int) or existing_revision < 1:
+            raise MemoryStorageCorruption(f"Stored fact {normalized['id']!r} has an invalid revision")
+        if revision != existing_revision:
+            raise MemoryRevisionConflict(f"Expected fact {normalized['id']!r} revision {revision}, found {existing_revision}")
+        normalized["createdAt"] = existing.get("createdAt") or normalized.get("createdAt") or now
+        comparison_keys = {"revision", "updatedAt"}
+        incoming_material = {key: value for key, value in normalized.items() if key not in comparison_keys}
+        existing_material = {key: value for key, value in existing.items() if key not in comparison_keys}
+        if incoming_material == existing_material:
+            normalized["revision"] = existing_revision
+            normalized["updatedAt"] = existing.get("updatedAt") or normalized["createdAt"]
+        else:
+            normalized["revision"] = existing_revision + 1
+            normalized["updatedAt"] = now
+    if not isinstance(normalized.get("createdAt"), str) or not isinstance(normalized.get("updatedAt"), str):
+        raise ValueError("fact.createdAt and fact.updatedAt must be strings")
     if normalized["consolidatedFrom"]:
         normalized.setdefault("consolidatedAt", normalized["updatedAt"])
     return normalized
+
+
+def _safe_relative_path(root: Path, relative: str, *, label: str) -> Path:
+    """Resolve an untrusted persisted relative path without leaving root."""
+    candidate = Path(relative)
+    if candidate.is_absolute():
+        raise MemoryStorageCorruption(f"{label} path escapes the user memory directory: {relative!r}")
+    root_resolved = root.resolve()
+    resolved = (root / candidate).resolve()
+    try:
+        resolved.relative_to(root_resolved)
+    except ValueError as exc:
+        raise MemoryStorageCorruption(f"{label} path escapes the user memory directory: {relative!r}") from exc
+    return resolved
 
 
 def _fact_title(fact: dict[str, Any]) -> str:
@@ -217,7 +290,7 @@ def _process_file_lock(lock_path: Path, timeout_seconds: float) -> Iterator[None
                 if os.name == "nt":
                     import msvcrt
 
-                    handle.seek(0)
+                    handle.seek(0, os.SEEK_END)
                     if handle.tell() == 0:
                         handle.write(b"0")
                         handle.flush()
@@ -302,23 +375,49 @@ class FileMemoryStorage(MemoryStorage):
                     signature.append((fact_path.as_posix(), *file_signature))
         return tuple(signature)
 
-    def _load_agent_facts(self, path: Path, agent_name: str | None) -> list[dict[str, Any]]:
+    @staticmethod
+    def _validate_loaded_fact(
+        fact: dict[str, Any],
+        fact_path: Path,
+        *,
+        user_id: str | None,
+        agent_name: str,
+    ) -> dict[str, Any]:
+        if str(fact.get("id")) != fact_path.stem:
+            raise MemoryStorageCorruption(f"Fact id mismatch for {fact_path}")
+        expected_scope = _scope_dict(user_id, agent_name)
+        actual_scope = fact.get("scope")
+        scope_matches = isinstance(actual_scope, dict) and actual_scope.get("userId") == user_id and isinstance(actual_scope.get("agentName"), str) and actual_scope["agentName"].lower() == agent_name.lower()
+        if not scope_matches:
+            raise MemoryStorageCorruption(f"Fact scope mismatch for {fact_path}: expected {expected_scope!r}, found {fact.get('scope')!r}")
+        try:
+            return _normalize_fact(fact, scope=copy.deepcopy(actual_scope))
+        except ValueError as exc:
+            raise MemoryStorageCorruption(f"Invalid canonical fact {fact_path}: {exc}") from exc
+
+    def _load_agent_facts(self, path: Path, agent_name: str | None, *, user_id: str | None) -> list[dict[str, Any]]:
         if agent_name is None:
             return []
         facts: list[dict[str, Any]] = []
         for fact_path in sorted(agent_facts_directory(path, agent_name).glob("**/*.md")):
             fact = _parse_fact_markdown(fact_path)
-            if str(fact.get("id")) != fact_path.stem:
-                raise MemoryStorageCorruption(f"Fact id mismatch for {fact_path}")
-            facts.append(fact)
+            facts.append(self._validate_loaded_fact(fact, fact_path, user_id=user_id, agent_name=agent_name))
         return facts
 
-    def _agent_entries(self, path: Path, agent_name: str | None) -> dict[str, dict[str, str]]:
+    def _read_fact(self, path: Path, fact_id: str, *, user_id: str | None, agent_name: str) -> tuple[dict[str, Any] | None, Path]:
+        fact_path = fact_file_path(path, fact_id, agent_name=agent_name)
+        if not fact_path.exists():
+            return None, fact_path
+        fact = _parse_fact_markdown(fact_path)
+        return self._validate_loaded_fact(fact, fact_path, user_id=user_id, agent_name=agent_name), fact_path
+
+    def _agent_entries(self, path: Path, agent_name: str | None, *, user_id: str | None) -> dict[str, dict[str, str]]:
         if agent_name is None:
             return {}
         entries: dict[str, dict[str, str]] = {}
         for fact_path in sorted(agent_facts_directory(path, agent_name).glob("**/*.md")):
             fact = _parse_fact_markdown(fact_path)
+            self._validate_loaded_fact(fact, fact_path, user_id=user_id, agent_name=agent_name)
             fact_id = str(fact.get("id") or "")
             if not fact_id or fact_id != fact_path.stem:
                 raise MemoryStorageCorruption(f"Fact id mismatch for {fact_path}")
@@ -328,24 +427,10 @@ class FileMemoryStorage(MemoryStorage):
     def _legacy_agent_memory_path(self, path: Path, agent_name: str) -> Path:
         return path.parent / "agents" / agent_name.lower() / path.name
 
-    def _migrate_legacy_agent_file(self, path: Path, agent_name: str, *, user_id: str | None) -> bool:
-        """Move facts out of the former per-agent memory.json on first access."""
-        legacy_path = self._legacy_agent_memory_path(path, agent_name)
-        if not legacy_path.exists():
-            return False
-        legacy_memory = self._load_memory_file(legacy_path)
-        if legacy_memory is None:
-            return False
-        document = self._document_from_memory_file(legacy_memory, legacy_path, agent_name)
-        global_memory = self._load_memory_file(path)
-        if global_memory is not None:
-            document["user"] = copy.deepcopy(global_memory.get("user", {}))
-            document["history"] = copy.deepcopy(global_memory.get("history", {}))
-        document["revision"] = int((global_memory or {}).get("revision") or 0)
-        if not self.save(document, agent_name, user_id=user_id, expected_revision=document["revision"]):
-            raise MemoryStorageError(f"Failed to migrate legacy agent memory {legacy_path}")
-        legacy_path.unlink(missing_ok=True)
-        return True
+    @staticmethod
+    def _migration_equivalent(left: dict[str, Any], right: dict[str, Any]) -> bool:
+        ignored = {"revision", "createdAt", "updatedAt", "scope", "title", "schemaVersion"}
+        return {key: value for key, value in left.items() if key not in ignored} == {key: value for key, value in right.items() if key not in ignored}
 
     def _load_memory_file(self, path: Path) -> dict[str, Any] | None:
         if not path.exists():
@@ -369,6 +454,8 @@ class FileMemoryStorage(MemoryStorage):
         try:
             journal = json.loads(journal_path.read_text(encoding="utf-8"))
             operation_id = str(journal["operationId"])
+            if not operation_id or Path(operation_id).name != operation_id:
+                raise TypeError("operationId must be a plain path component")
             state = journal.get("state")
             old_entries = journal.get("oldEntries", {})
             agent_name = journal.get("agentName")
@@ -391,20 +478,223 @@ class FileMemoryStorage(MemoryStorage):
                             raise MemoryStorageCorruption(f"Journal {journal_path} contains facts without agentName")
                         fact_file_path(path, str(fact_id), agent_name=agent_name).unlink(missing_ok=True)
                 for fact_id, entry in old_entries.items():
+                    if not isinstance(fact_id, str) or not fact_id or any(character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-" for character in fact_id):
+                        raise MemoryStorageCorruption(f"Journal {journal_path} contains an invalid fact id")
                     if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
                         continue
                     backup = recovery_dir / f"{fact_id}.md"
                     if backup.exists():
-                        _atomic_write(path.parent / entry["path"], backup.read_bytes())
+                        _atomic_write(_safe_relative_path(path.parent, entry["path"], label="journal"), backup.read_bytes())
         elif state != "committed":
             raise MemoryStorageCorruption(f"Unknown journal state {state!r} in {journal_path}")
         if recovery_dir.exists():
             shutil.rmtree(recovery_dir)
         journal_path.unlink(missing_ok=True)
 
-    def _document_from_memory_file(self, memory_file: dict[str, Any], path: Path, agent_name: str | None) -> dict[str, Any]:
+    def _commit_changes_locked(
+        self,
+        path: Path,
+        *,
+        user_id: str | None,
+        agent_name: str | None,
+        upserts: list[dict[str, Any]],
+        deletes: list[str],
+        summaries: dict[str, Any] | None,
+        expected_revision: int | None,
+        delete_revisions: dict[str, int] | None = None,
+    ) -> tuple[dict[str, Any], list[tuple[str, dict[str, Any] | str, str | None]]]:
+        """Commit only the addressed fact files plus the shared summary JSON.
+
+        Callers hold both locks and have already run journal recovery.  This is
+        deliberately not implemented as load-all/replace-all: unchanged fact
+        files are neither opened for backup nor rewritten nor re-indexed.
+        """
+        current_memory = self._load_memory_file(path)
+        current_revision = int((current_memory or {}).get("revision") or 0)
+        if expected_revision is not None and expected_revision != current_revision:
+            raise MemoryRevisionConflict(f"Expected user-memory revision {expected_revision}, found {current_revision}")
+        if (upserts or deletes) and agent_name is None:
+            raise ValueError("agent_name is required for fact repository changes")
+
+        scope = _scope_dict(user_id, agent_name)
+        prepared: dict[str, tuple[dict[str, Any], dict[str, Any] | None, Path]] = {}
+        for incoming in upserts:
+            if not isinstance(incoming, dict):
+                raise ValueError("change_set.upserts must contain fact objects")
+            candidate = copy.deepcopy(incoming)
+            candidate["id"] = str(candidate.get("id") or f"fact_{uuid.uuid4().hex}")
+            fact_id = candidate["id"]
+            if fact_id in prepared:
+                raise ValueError(f"Duplicate fact id {fact_id!r} in upserts")
+            if agent_name is None:  # guarded above
+                raise ValueError("agent_name is required for fact repository changes")
+            existing, fact_path = self._read_fact(path, fact_id, user_id=user_id, agent_name=agent_name)
+            normalized = _normalize_fact(candidate, scope=scope, existing=existing)
+            if existing != normalized:
+                prepared[fact_id] = (normalized, existing, fact_path)
+
+        delete_ids = [str(fact_id) for fact_id in deletes]
+        if len(delete_ids) != len(set(delete_ids)):
+            raise ValueError("Duplicate fact ids are not allowed in deletes")
+        removals: dict[str, tuple[dict[str, Any], Path]] = {}
+        for fact_id in delete_ids:
+            if fact_id in prepared:
+                raise ValueError(f"Fact {fact_id!r} cannot be upserted and deleted together")
+            if agent_name is None:  # guarded above
+                raise ValueError("agent_name is required for fact repository changes")
+            existing, fact_path = self._read_fact(path, fact_id, user_id=user_id, agent_name=agent_name)
+            if existing is None:
+                continue
+            if delete_revisions and fact_id in delete_revisions and delete_revisions[fact_id] != existing.get("revision"):
+                raise MemoryRevisionConflict(f"Expected fact {fact_id!r} revision {delete_revisions[fact_id]}, found {existing.get('revision')}")
+            removals[fact_id] = (existing, fact_path)
+
+        base = current_memory or create_empty_memory()
+        user_section = copy.deepcopy(base.get("user", {}))
+        history_section = copy.deepcopy(base.get("history", {}))
+        if summaries is not None:
+            if agent_name is not None:
+                raise ValueError("Only global writes may update user/history summaries")
+            if not isinstance(summaries, dict):
+                raise ValueError("change_set.summaries must be an object")
+            if "user" in summaries:
+                user_section = copy.deepcopy(summaries["user"])
+            if "history" in summaries:
+                history_section = copy.deepcopy(summaries["history"])
+        summaries_changed = user_section != base.get("user", {}) or history_section != base.get("history", {})
+        needs_manifest_cleanup = current_memory is None or current_memory.get("version") != DOCUMENT_VERSION or "facts" in current_memory
+        if not prepared and not removals and not summaries_changed and not needs_manifest_cleanup:
+            memory_file = current_memory or {
+                "version": DOCUMENT_VERSION,
+                "revision": 0,
+                "lastUpdated": base.get("lastUpdated", utc_now_iso_z()),
+                "user": user_section,
+                "history": history_section,
+            }
+            return memory_file, []
+
+        next_revision = current_revision + 1
+        old_entries: dict[str, dict[str, str]] = {}
+        for fact_id, (_, existing, fact_path) in prepared.items():
+            if existing is not None:
+                old_entries[fact_id] = {"path": fact_path.relative_to(path.parent).as_posix()}
+        for fact_id, (_, fact_path) in removals.items():
+            old_entries[fact_id] = {"path": fact_path.relative_to(path.parent).as_posix()}
+        fact_ids = list(prepared) + list(removals)
+        journal = {
+            "operationId": uuid.uuid4().hex,
+            "state": "prepared",
+            "agentName": agent_name,
+            "expectedRevision": current_revision,
+            "nextRevision": next_revision,
+            "factIds": fact_ids,
+            "oldEntries": old_entries,
+        }
+        journal_path = path.parent / ".memory.journal.json"
+        recovery_dir = path.parent / ".recovery" / journal["operationId"]
+        recovery_dir.mkdir(parents=True, exist_ok=True)
+        if current_memory is not None:
+            shutil.copy2(path, recovery_dir / "memory.json")
+        for fact_id, entry in old_entries.items():
+            old_path = _safe_relative_path(path.parent, entry["path"], label="journal")
+            if old_path.exists():
+                shutil.copy2(old_path, recovery_dir / f"{fact_id}.md")
+        _atomic_write(journal_path, json.dumps(journal, ensure_ascii=False, indent=2).encode("utf-8"))
+
+        notifications: list[tuple[str, dict[str, Any] | str, str | None]] = []
+        for fact_id, (fact, _, fact_path) in prepared.items():
+            _atomic_write(fact_path, _render_fact_markdown(fact))
+            notifications.append(("upsert", fact, str(fact_path)))
+        for fact_id, (_, fact_path) in removals.items():
+            fact_path.unlink(missing_ok=True)
+            notifications.append(("remove", fact_id, None))
+
+        memory_file = {
+            "version": DOCUMENT_VERSION,
+            "revision": next_revision,
+            "lastUpdated": utc_now_iso_z(),
+            "user": user_section,
+            "history": history_section,
+        }
+        _atomic_write(path, json.dumps(memory_file, ensure_ascii=False, indent=2).encode("utf-8"))
+        journal["state"] = "committed"
+        _atomic_write(journal_path, json.dumps(journal, ensure_ascii=False, indent=2).encode("utf-8"))
+        shutil.rmtree(recovery_dir, ignore_errors=True)
+        journal_path.unlink(missing_ok=True)
+        with self._cache_lock:
+            for cache_key in [cache_key for cache_key in self._memory_cache if cache_key[0] == user_id]:
+                self._memory_cache.pop(cache_key, None)
+        return memory_file, notifications
+
+    def _migrate_locked(self, path: Path, agent_name: str, *, user_id: str | None, include_global: bool) -> tuple[bool, str | None]:
+        """Merge legacy facts without overwriting an existing canonical fact."""
+        sources: list[tuple[Path, dict[str, Any]]] = []
+        legacy_path = self._legacy_agent_memory_path(path, agent_name)
+        legacy_memory = self._load_memory_file(legacy_path)
+        if legacy_memory is not None:
+            sources.append((legacy_path, legacy_memory))
+        global_memory = self._load_memory_file(path)
+        from_version = None if global_memory is None else global_memory.get("version")
+        if include_global and global_memory is not None and ("facts" in global_memory or global_memory.get("version") != DOCUMENT_VERSION):
+            sources.append((path, global_memory))
+        if not sources:
+            return False, from_version
+
+        upserts: list[dict[str, Any]] = []
+        pending: dict[str, dict[str, Any]] = {}
+        for source_path, source_memory in sources:
+            source_document = self._document_from_memory_file(
+                source_memory,
+                source_path,
+                agent_name,
+                user_id=user_id,
+                allow_legacy_facts=True,
+            )
+            for raw_fact in source_document.get("facts", []):
+                if not isinstance(raw_fact, dict):
+                    raise MemoryStorageCorruption(f"Legacy fact in {source_path} is not an object")
+                candidate = _normalize_fact(raw_fact, scope=_scope_dict(user_id, agent_name))
+                existing, _ = self._read_fact(path, candidate["id"], user_id=user_id, agent_name=agent_name)
+                if existing is not None:
+                    if not self._migration_equivalent(candidate, existing):
+                        raise MemoryStorageCorruption(f"Fact migration conflict for {candidate['id']!r}")
+                    continue
+                previous = pending.get(candidate["id"])
+                if previous is not None:
+                    if not self._migration_equivalent(candidate, previous):
+                        raise MemoryStorageCorruption(f"Fact migration conflict for {candidate['id']!r}")
+                    continue
+                pending[candidate["id"]] = candidate
+                upserts.append(candidate)
+
+        current_revision = int((global_memory or {}).get("revision") or 0)
+        self._commit_changes_locked(
+            path,
+            user_id=user_id,
+            agent_name=agent_name,
+            upserts=upserts,
+            deletes=[],
+            summaries=None,
+            expected_revision=current_revision,
+        )
+        if legacy_memory is not None:
+            legacy_path.unlink(missing_ok=True)
+        return True, from_version
+
+    def _document_from_memory_file(
+        self,
+        memory_file: dict[str, Any],
+        path: Path,
+        agent_name: str | None,
+        *,
+        user_id: str | None,
+        allow_legacy_facts: bool = False,
+    ) -> dict[str, Any]:
         """Build the compatibility document without persisting facts in JSON."""
         legacy_facts = memory_file.get("facts")
+        contains_owned_legacy_facts = isinstance(legacy_facts, dict) or (isinstance(legacy_facts, list) and bool(legacy_facts))
+        if contains_owned_legacy_facts and not allow_legacy_facts:
+            raise MemoryStorageCorruption(f"Legacy facts in {path} require explicit migrate(user_id=..., agent_name=...)")
         if isinstance(legacy_facts, list):
             facts = copy.deepcopy(legacy_facts) if agent_name is not None else []
         elif isinstance(legacy_facts, dict):
@@ -413,13 +703,15 @@ class FileMemoryStorage(MemoryStorage):
                 for fact_id, entry in legacy_facts.items():
                     if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
                         raise MemoryStorageCorruption(f"Invalid legacy manifest entry for fact {fact_id!r}")
-                    fact_path = path.parent / entry["path"]
+                    fact_path = _safe_relative_path(path.parent, entry["path"], label="legacy fact")
                     fact = _parse_fact_markdown(fact_path)
+                    if str(fact.get("id")) != str(fact_id):
+                        raise MemoryStorageCorruption(f"Legacy manifest id mismatch for fact {fact_id!r}")
                     if entry.get("contentHash") and entry.get("contentHash") != _content_hash(fact_path.read_bytes()):
                         raise MemoryStorageCorruption(f"Hash mismatch for canonical fact {fact_id!r}")
                     facts.append(fact)
         elif legacy_facts is None:
-            facts = self._load_agent_facts(path, agent_name)
+            facts = self._load_agent_facts(path, agent_name, user_id=user_id)
         else:
             raise MemoryStorageCorruption(f"Legacy facts in {path} must be a list or mapping")
         result = {key: copy.deepcopy(value) for key, value in memory_file.items() if key != "facts"}
@@ -427,40 +719,30 @@ class FileMemoryStorage(MemoryStorage):
         result["facts"] = facts
         return result
 
-    def _read_document(self, path: Path, agent_name: str | None) -> dict[str, Any]:
+    def _read_document(self, path: Path, agent_name: str | None, *, user_id: str | None) -> dict[str, Any]:
         memory_file = self._load_memory_file(path)
         if memory_file is None:
             result = create_empty_memory()
-            result["facts"] = self._load_agent_facts(path, agent_name)
+            result["facts"] = self._load_agent_facts(path, agent_name, user_id=user_id)
             return result
-        return self._document_from_memory_file(memory_file, path, agent_name)
+        return self._document_from_memory_file(memory_file, path, agent_name, user_id=user_id)
 
     def load(self, agent_name: str | None = None, *, user_id: str | None = None) -> dict[str, Any]:
         path = self._get_memory_file_path(agent_name, user_id=user_id)
         key = self._cache_key(agent_name, user_id=user_id)
-        if agent_name is not None:
-            self._migrate_legacy_agent_file(path, agent_name, user_id=user_id)
         journal_path = path.parent / ".memory.journal.json"
-        if journal_path.exists():
+        legacy_path = self._legacy_agent_memory_path(path, agent_name) if agent_name is not None else None
+        if journal_path.exists() or (legacy_path is not None and legacy_path.exists()):
             with self._scope_lock(key), _process_file_lock(path.parent / ".memory.lock", float(getattr(self._config, "file_lock_timeout_seconds", 10))):
                 self._recover_if_needed(path)
+                if agent_name is not None:
+                    self._migrate_locked(path, agent_name, user_id=user_id, include_global=False)
         signature = self._scope_signature(path, agent_name)
         with self._cache_lock:
             cached = self._memory_cache.get(key)
             if cached is not None and cached[1] == signature:
                 return copy.deepcopy(cached[0])
-        memory_file = self._load_memory_file(path)
-        document = self._read_document(path, agent_name)
-        needs_migration = memory_file is not None and (memory_file.get("version") != DOCUMENT_VERSION or "facts" in memory_file)
-        if agent_name is not None and needs_migration:
-            try:
-                if not self.save(document, agent_name, user_id=user_id, expected_revision=int(document.get("revision") or 0)):
-                    raise MemoryStorageError(f"Failed to migrate legacy memory document {path}")
-            except MemoryRevisionConflict:
-                # Another reader completed the one-time migration first.
-                pass
-            document = self._read_document(path, agent_name)
-            signature = self._scope_signature(path, agent_name)
+        document = self._read_document(path, agent_name, user_id=user_id)
         with self._cache_lock:
             self._memory_cache[key] = (copy.deepcopy(document), signature)
         return copy.deepcopy(document)
@@ -468,22 +750,13 @@ class FileMemoryStorage(MemoryStorage):
     def reload(self, agent_name: str | None = None, *, user_id: str | None = None) -> dict[str, Any]:
         path = self._get_memory_file_path(agent_name, user_id=user_id)
         key = self._cache_key(agent_name, user_id=user_id)
-        if agent_name is not None:
-            self._migrate_legacy_agent_file(path, agent_name, user_id=user_id)
-        if (path.parent / ".memory.journal.json").exists():
+        legacy_path = self._legacy_agent_memory_path(path, agent_name) if agent_name is not None else None
+        if (path.parent / ".memory.journal.json").exists() or (legacy_path is not None and legacy_path.exists()):
             with self._scope_lock(key), _process_file_lock(path.parent / ".memory.lock", float(getattr(self._config, "file_lock_timeout_seconds", 10))):
                 self._recover_if_needed(path)
-        memory_file = self._load_memory_file(path)
-        document = self._read_document(path, agent_name)
-        needs_migration = memory_file is not None and (memory_file.get("version") != DOCUMENT_VERSION or "facts" in memory_file)
-        if agent_name is not None and needs_migration:
-            try:
-                if not self.save(document, agent_name, user_id=user_id, expected_revision=int(document.get("revision") or 0)):
-                    raise MemoryStorageError(f"Failed to migrate legacy memory document {path}")
-            except MemoryRevisionConflict:
-                # Another reader completed the one-time migration first.
-                pass
-            document = self._read_document(path, agent_name)
+                if agent_name is not None:
+                    self._migrate_locked(path, agent_name, user_id=user_id, include_global=False)
+        document = self._read_document(path, agent_name, user_id=user_id)
         signature = self._scope_signature(path, agent_name)
         with self._cache_lock:
             self._memory_cache[key] = (copy.deepcopy(document), signature)
@@ -498,13 +771,15 @@ class FileMemoryStorage(MemoryStorage):
         """Run the idempotent version-driven migration for one exact scope."""
         if agent_name is None:
             raise ValueError("agent_name is required to migrate legacy facts")
-        before_path = self._get_memory_file_path(agent_name, user_id=user_id)
-        before = self._load_memory_file(before_path)
-        needed = before is not None and (before.get("version") != DOCUMENT_VERSION or "facts" in before)
+        path = self._get_memory_file_path(agent_name, user_id=user_id)
+        key = self._cache_key(agent_name, user_id=user_id)
+        with self._scope_lock(key), _process_file_lock(path.parent / ".memory.lock", float(getattr(self._config, "file_lock_timeout_seconds", 10))):
+            self._recover_if_needed(path)
+            migrated, from_version = self._migrate_locked(path, agent_name, user_id=user_id, include_global=True)
         document = self.reload(agent_name, user_id=user_id)
         return {
-            "migrated": needed,
-            "fromVersion": None if before is None else before.get("version"),
+            "migrated": migrated,
+            "fromVersion": from_version,
             "toVersion": document.get("version"),
             "revision": document.get("revision", 0),
         }
@@ -517,95 +792,48 @@ class FileMemoryStorage(MemoryStorage):
         user_id: str | None = None,
         expected_revision: int | None = None,
     ) -> bool:
+        """Compatibility full replacement, diffed into per-fact operations.
+
+        This API must scan the selected agent to determine which omitted facts
+        are deletions, but the commit writes only new/changed/deleted facts.
+        Repository callers should prefer ``apply_changes`` to avoid even that
+        full comparison scan.
+        """
         path = self._get_memory_file_path(agent_name, user_id=user_id)
         key = self._cache_key(agent_name, user_id=user_id)
         lock_path = path.parent / ".memory.lock"
-        journal_path = path.parent / ".memory.journal.json"
-        scope = _scope_dict(user_id, agent_name)
         notifications: list[tuple[str, dict[str, Any] | str, str | None]] = []
         try:
+            if not isinstance(memory_data, dict):
+                raise ValueError("memory_data must be an object")
+            if agent_name is not None and "facts" not in memory_data:
+                raise ValueError("memory_data.facts is required for an agent full save")
+            facts_raw = memory_data.get("facts", [])
+            if not isinstance(facts_raw, list):
+                raise ValueError("memory_data.facts must be a list")
+            if any(not isinstance(fact, dict) for fact in facts_raw):
+                raise ValueError("memory_data.facts must contain only fact objects")
+            if agent_name is None and facts_raw:
+                raise ValueError("agent_name is required to persist facts")
             with self._scope_lock(key), _process_file_lock(lock_path, float(getattr(self._config, "file_lock_timeout_seconds", 10))):
                 self._recover_if_needed(path)
-                current_memory_file = self._load_memory_file(path)
-                current_revision = int((current_memory_file or {}).get("revision") or 0)
-                if expected_revision is not None and expected_revision != current_revision:
-                    raise MemoryRevisionConflict(f"Expected user-memory revision {expected_revision}, found {current_revision}")
-                facts_raw = memory_data.get("facts", [])
-                if not isinstance(facts_raw, list):
-                    raise ValueError("memory_data.facts must be a list")
-                if agent_name is None and facts_raw:
-                    raise ValueError("agent_name is required to persist facts")
-                old_entries = self._agent_entries(path, agent_name)
-                facts = [_normalize_fact(fact, scope=scope) for fact in facts_raw if isinstance(fact, dict)] if agent_name is not None else []
-                ids = [fact["id"] for fact in facts]
+                ids = [str(fact.get("id") or "") for fact in facts_raw]
                 if len(ids) != len(set(ids)):
                     raise ValueError("Duplicate fact ids are not allowed")
-                next_revision = current_revision + 1
-                journal = {
-                    "operationId": uuid.uuid4().hex,
-                    "state": "prepared",
-                    "agentName": agent_name,
-                    "expectedRevision": current_revision,
-                    "nextRevision": next_revision,
-                    "factIds": ids,
-                    "oldEntries": copy.deepcopy(old_entries),
-                }
-                recovery_dir = path.parent / ".recovery" / journal["operationId"]
-                if current_memory_file is not None or old_entries:
-                    recovery_dir.mkdir(parents=True, exist_ok=True)
-                    if current_memory_file is not None:
-                        shutil.copy2(path, recovery_dir / "memory.json")
-                    for old_fact_id, old_entry in old_entries.items():
-                        if isinstance(old_entry, dict) and isinstance(old_entry.get("path"), str):
-                            old_fact_path = path.parent / old_entry["path"]
-                            if old_fact_path.exists():
-                                shutil.copy2(old_fact_path, recovery_dir / f"{old_fact_id}.md")
-                _atomic_write(journal_path, json.dumps(journal, ensure_ascii=False, indent=2).encode("utf-8"))
-
-                entries: dict[str, Any] = {}
-                for fact in facts:
-                    if agent_name is None:  # guarded above; keeps the type checker honest
-                        raise ValueError("agent_name is required to persist facts")
-                    fact_path = fact_file_path(path, fact["id"], agent_name=agent_name)
-                    raw = _render_fact_markdown(fact)
-                    _atomic_write(fact_path, raw)
-                    entries[fact["id"]] = {
-                        "path": fact_path.relative_to(path.parent).as_posix(),
-                    }
-                    notifications.append(("upsert", fact, str(fact_path)))
-
-                removed = set(old_entries) - set(entries)
-                for fact_id in removed:
-                    entry = old_entries.get(fact_id)
-                    if isinstance(entry, dict) and isinstance(entry.get("path"), str):
-                        old_path = path.parent / entry["path"]
-                        if old_path.exists():
-                            old_path.unlink()
-                    notifications.append(("remove", fact_id, None))
-
+                old_ids = set(self._agent_entries(path, agent_name, user_id=user_id)) if agent_name is not None else set()
+                summaries = None
                 if agent_name is None:
-                    user_section = copy.deepcopy(memory_data.get("user", {}))
-                    history_section = copy.deepcopy(memory_data.get("history", {}))
-                else:
-                    # Agent conversations may contain project-specific summaries.
-                    # Only a global (agent_name=None) write may change user/history.
-                    base = current_memory_file or create_empty_memory()
-                    user_section = copy.deepcopy(base.get("user", {}))
-                    history_section = copy.deepcopy(base.get("history", {}))
-                memory_file = {
-                    "version": DOCUMENT_VERSION,
-                    "revision": next_revision,
-                    "lastUpdated": utc_now_iso_z(),
-                    "user": user_section,
-                    "history": history_section,
-                }
-                _atomic_write(path, json.dumps(memory_file, ensure_ascii=False, indent=2).encode("utf-8"))
-                journal["state"] = "committed"
-                _atomic_write(journal_path, json.dumps(journal, ensure_ascii=False, indent=2).encode("utf-8"))
-                if recovery_dir.exists():
-                    shutil.rmtree(recovery_dir)
-                journal_path.unlink(missing_ok=True)
-                document = self._document_from_memory_file(memory_file, path, agent_name)
+                    summaries = {"user": memory_data.get("user", {}), "history": memory_data.get("history", {})}
+                _, notifications = self._commit_changes_locked(
+                    path,
+                    user_id=user_id,
+                    agent_name=agent_name,
+                    upserts=copy.deepcopy(facts_raw),
+                    deletes=sorted(old_ids - set(ids)),
+                    summaries=summaries,
+                    expected_revision=expected_revision,
+                )
+                document = self._read_document(path, agent_name, user_id=user_id)
                 signature = self._scope_signature(path, agent_name)
                 with self._cache_lock:
                     self._memory_cache[key] = (copy.deepcopy(document), signature)
@@ -616,6 +844,7 @@ class FileMemoryStorage(MemoryStorage):
             return False
 
         if self._retrieval is not None:
+            scope = _scope_dict(user_id, agent_name)
             for action, value, fact_path in notifications:
                 try:
                     if action == "upsert":
@@ -642,10 +871,17 @@ class FileMemoryStorage(MemoryStorage):
         user_id: str | None = None,
         agent_name: str | None = None,
     ) -> dict[str, Any] | None:
-        for fact in self.load(agent_name, user_id=user_id).get("facts", []):
-            if str(fact.get("id")) == fact_id:
-                return copy.deepcopy(fact)
-        return None
+        if agent_name is None:
+            raise ValueError("agent_name is required to get a fact")
+        path = self._get_memory_file_path(agent_name, user_id=user_id)
+        key = self._cache_key(agent_name, user_id=user_id)
+        legacy_path = self._legacy_agent_memory_path(path, agent_name)
+        with self._scope_lock(key), _process_file_lock(path.parent / ".memory.lock", float(getattr(self._config, "file_lock_timeout_seconds", 10))):
+            self._recover_if_needed(path)
+            if legacy_path.exists():
+                self._migrate_locked(path, agent_name, user_id=user_id, include_global=False)
+            fact, _ = self._read_fact(path, fact_id, user_id=user_id, agent_name=agent_name)
+        return copy.deepcopy(fact)
 
     def list_facts(
         self,
@@ -671,33 +907,86 @@ class FileMemoryStorage(MemoryStorage):
         agent_name: str | None = None,
         expected_manifest_revision: int | None = None,
     ) -> dict[str, Any]:
-        """Commit summary/fact changes through the same journaled save path."""
+        """Commit an incremental change set without materializing all facts."""
         has_fact_changes = bool(change_set.get("upserts") or change_set.get("deletes"))
         if has_fact_changes and agent_name is None:
             raise ValueError("agent_name is required for fact repository changes")
-        document = self.load(agent_name, user_id=user_id)
-        by_id = {str(fact.get("id")): copy.deepcopy(fact) for fact in document.get("facts", [])}
-        for fact_id in change_set.get("deletes", []):
-            by_id.pop(str(fact_id), None)
-        for fact in change_set.get("upserts", []):
-            if not isinstance(fact, dict):
-                raise ValueError("change_set.upserts must contain fact objects")
-            normalized_id = str(fact.get("id") or f"fact_{uuid.uuid4().hex}")
-            fact = copy.deepcopy(fact)
-            fact["id"] = normalized_id
-            by_id[normalized_id] = fact
         summaries = change_set.get("summaries")
-        if summaries is not None and agent_name is None:
-            if not isinstance(summaries, dict):
-                raise ValueError("change_set.summaries must be an object")
-            for section in ("user", "history"):
-                if section in summaries:
-                    document[section] = copy.deepcopy(summaries[section])
-        document["facts"] = list(by_id.values())
-        expected = int(document.get("revision") or 0) if expected_manifest_revision is None else expected_manifest_revision
-        if not self.save(document, agent_name, user_id=user_id, expected_revision=expected):
-            raise MemoryStorageError("Failed to apply memory repository changes")
-        return self.reload(agent_name, user_id=user_id)
+        if summaries is not None and agent_name is not None:
+            raise ValueError("Agent fact changes cannot update global summaries")
+        upserts = change_set.get("upserts", [])
+        deletes = change_set.get("deletes", [])
+        delete_revisions = change_set.get("deleteRevisions")
+        if not isinstance(upserts, list) or not isinstance(deletes, list):
+            raise ValueError("change_set.upserts and change_set.deletes must be lists")
+        if delete_revisions is not None and not isinstance(delete_revisions, dict):
+            raise ValueError("change_set.deleteRevisions must be an object")
+
+        path = self._get_memory_file_path(agent_name, user_id=user_id)
+        key = self._cache_key(agent_name, user_id=user_id)
+        with self._cache_lock:
+            cached_before = copy.deepcopy(self._memory_cache.get(key, (None, ()))[0])
+        expected = expected_manifest_revision
+        notifications: list[tuple[str, dict[str, Any] | str, str | None]] = []
+        memory_file: dict[str, Any] | None = None
+        safe_delete_rebase = not deletes or (isinstance(delete_revisions, dict) and all(str(fact_id) in delete_revisions for fact_id in deletes))
+        for attempt in range(3):
+            try:
+                with self._scope_lock(key), _process_file_lock(path.parent / ".memory.lock", float(getattr(self._config, "file_lock_timeout_seconds", 10))):
+                    self._recover_if_needed(path)
+                    memory_file, notifications = self._commit_changes_locked(
+                        path,
+                        user_id=user_id,
+                        agent_name=agent_name,
+                        upserts=copy.deepcopy(upserts),
+                        deletes=[str(fact_id) for fact_id in deletes],
+                        summaries=copy.deepcopy(summaries),
+                        expected_revision=expected,
+                        delete_revisions=copy.deepcopy(delete_revisions),
+                    )
+                break
+            except MemoryRevisionConflict as exc:
+                can_rebase = has_fact_changes and summaries is None and safe_delete_rebase and attempt < 2
+                if not can_rebase:
+                    raise
+                current = self._load_memory_file(path)
+                expected = int((current or {}).get("revision") or 0)
+                logger.info("Rebasing disjoint memory fact change after revision conflict: %s", exc)
+        if self._retrieval is not None:
+            scope = _scope_dict(user_id, agent_name)
+            for action, value, fact_path in notifications:
+                try:
+                    if action == "upsert":
+                        self._retrieval.upsert(copy.deepcopy(value), scope=scope, path=fact_path or "")
+                    else:
+                        self._retrieval.remove(str(value), scope=scope)
+                except Exception:
+                    logger.exception("Retrieval notification failed for %s", value)
+        if memory_file is None:  # defensive: the bounded loop either commits or raises
+            raise MemoryStorageError("Memory repository change did not produce a result")
+        result = (
+            cached_before
+            if isinstance(cached_before, dict)
+            else {
+                **copy.deepcopy(memory_file),
+                "facts": [],
+            }
+        )
+        for key_name in ("version", "revision", "lastUpdated", "user", "history"):
+            if key_name in memory_file:
+                result[key_name] = copy.deepcopy(memory_file[key_name])
+        by_id = {str(fact.get("id")): copy.deepcopy(fact) for fact in result.get("facts", []) if isinstance(fact, dict)}
+        for action, value, _ in notifications:
+            if action == "upsert" and isinstance(value, dict):
+                by_id[str(value["id"])] = copy.deepcopy(value)
+            elif action == "remove":
+                by_id.pop(str(value), None)
+        result["facts"] = list(by_id.values()) if agent_name is not None else []
+        # Keep an incremental snapshot for a following change set, but mark its
+        # disk signature unknown so a normal load still validates the files.
+        with self._cache_lock:
+            self._memory_cache[key] = (copy.deepcopy(result), ())
+        return result
 
     def upsert_fact(
         self,
@@ -806,9 +1095,15 @@ class FileMemoryStorage(MemoryStorage):
             for path in candidates:
                 try:
                     fact = _parse_fact_markdown(path)
+                    relative_parts = path.relative_to(root).parts
+                    agents_index = relative_parts.index("agents")
+                    expected_agent = relative_parts[agents_index + 1]
+                    expected_user = relative_parts[1] if len(relative_parts) > 1 and relative_parts[0] == "users" else None
+                    self._validate_loaded_fact(fact, path, user_id=expected_user, agent_name=expected_agent)
                     self.notify_fact_upsert(fact, path=str(path))
                     indexed += 1
-                except (MemoryStorageError, OSError, ValueError):
+                except Exception:
+                    logger.exception("Failed to rebuild retrieval index for %s", path)
                     failed += 1
         else:
             for scope in scopes:
@@ -821,7 +1116,8 @@ class FileMemoryStorage(MemoryStorage):
                     try:
                         self.notify_fact_upsert(fact, path=str(fact_file_path(memory_path, fact["id"], agent_name=agent_name)))
                         indexed += 1
-                    except (OSError, ValueError):
+                    except Exception:
+                        logger.exception("Failed to rebuild retrieval index for fact %s", fact.get("id"))
                         failed += 1
         return {"supported": True, "indexed": indexed, "failed": failed}
 
