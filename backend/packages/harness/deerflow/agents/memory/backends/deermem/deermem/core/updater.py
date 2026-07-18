@@ -691,9 +691,8 @@ class MemoryUpdater:
         )
         updated_memory["facts"] = _trim_facts_to_max(facts, self._config.max_facts)
         if getattr(type(self._storage), "apply_changes", None) is not MemoryStorage.apply_changes:
-            stored = any(f.get("id") == fact_id for f in updated_memory["facts"])
             kept_ids = {str(fact.get("id")) for fact in updated_memory["facts"]}
-            result = self._storage.apply_changes(
+            self._storage.apply_changes(
                 {
                     "upserts": [fact for fact in updated_memory["facts"] if fact.get("id") == fact_id],
                     "upsertRevisions": {fact_id: None},
@@ -704,12 +703,14 @@ class MemoryUpdater:
                 user_id=user_id,
                 expected_manifest_revision=int(memory_data.get("revision") or 0),
             )
-            normalized_by_id = {str(fact.get("id")): fact for fact in result["upsertedFacts"]}
-            deleted_ids = set(result["deletedFactIds"])
-            updated_memory["facts"] = [copy.deepcopy(normalized_by_id.get(str(fact.get("id")), fact)) for fact in updated_memory["facts"] if str(fact.get("id")) not in deleted_ids]
-            for field in ("version", "revision", "lastUpdated"):
-                updated_memory[field] = result[field]
-            return updated_memory, (fact_id if stored else None)
+            # ``apply_changes`` returns an incremental delta. A disjoint writer
+            # may have committed between our snapshot and the successful
+            # rebase, so reconstructing a document from that old snapshot can
+            # omit its sibling fact. Reload only at this compatibility boundary;
+            # the mutation itself remains a per-fact write.
+            fresh_memory = self.get_memory_data(agent_name, user_id=user_id)
+            stored = any(fact.get("id") == fact_id for fact in fresh_memory.get("facts", []))
+            return fresh_memory, (fact_id if stored else None)
         if not self._save_memory_to_file(updated_memory, agent_name, user_id=user_id, expected_revision=int(memory_data.get("revision") or 0)):
             raise OSError("Failed to save memory data after creating fact")
         # If the cap evicted the just-added (lower-confidence) fact, signal via

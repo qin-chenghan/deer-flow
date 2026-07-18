@@ -1,4 +1,5 @@
 import asyncio
+import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -189,6 +190,21 @@ def test_settings_fact_crud_without_agent_name_uses_default_agent(tmp_path) -> N
     """The current Settings API sends no agent_name; it must remain usable."""
     app = FastAPI()
     app.include_router(memory.router)
+    memory_path = tmp_path / "users" / "alice" / "memory.json"
+    memory_path.parent.mkdir(parents=True)
+    legacy = _sample_memory(
+        facts=[
+            {
+                "id": "fact_legacy",
+                "content": "Legacy global fact",
+                "category": "context",
+                "confidence": 0.9,
+                "createdAt": "2026-03-20T00:00:00Z",
+                "source": "manual",
+            }
+        ]
+    )
+    memory_path.write_text(json.dumps(legacy), encoding="utf-8")
     manager = DeerMem(backend_config={"storage_path": str(tmp_path)})
 
     with (
@@ -196,9 +212,17 @@ def test_settings_fact_crud_without_agent_name_uses_default_agent(tmp_path) -> N
         patch("app.gateway.routers.memory.get_effective_user_id", return_value="alice"),
         TestClient(app) as client,
     ):
+        fetched = client.get("/api/memory")
+        assert fetched.status_code == 200
+        assert [fact["content"] for fact in fetched.json()["facts"]] == ["Legacy global fact"]
+
+        exported = client.get("/api/memory/export")
+        assert exported.status_code == 200
+        assert [fact["content"] for fact in exported.json()["facts"]] == ["Legacy global fact"]
+
         created = client.post("/api/memory/facts", json={"content": "Project uses Python", "category": "context", "confidence": 0.8})
         assert created.status_code == 200
-        fact_id = created.json()["facts"][0]["id"]
+        fact_id = next(fact["id"] for fact in created.json()["facts"] if fact["content"] == "Project uses Python")
 
         updated = client.patch(f"/api/memory/facts/{fact_id}", json={"content": "Project uses Python 3.12"})
         assert updated.status_code == 200
@@ -206,11 +230,16 @@ def test_settings_fact_crud_without_agent_name_uses_default_agent(tmp_path) -> N
 
         deleted = client.delete(f"/api/memory/facts/{fact_id}")
         assert deleted.status_code == 200
-        assert deleted.json()["facts"] == []
+        assert [fact["id"] for fact in deleted.json()["facts"]] == ["fact_legacy"]
 
-    facts_root = tmp_path / "users" / "alice" / "agents" / "lead-agent" / "facts"
+        deleted_legacy = client.delete("/api/memory/facts/fact_legacy")
+        assert deleted_legacy.status_code == 200
+        assert deleted_legacy.json()["facts"] == []
+
+    facts_root = tmp_path / "users" / "alice" / "agents" / "__default__" / "facts"
     assert facts_root.exists()
     assert not list(facts_root.glob("**/*.md"))
+    assert "facts" not in json.loads(memory_path.read_text(encoding="utf-8"))
 
 
 def test_update_memory_fact_route_preserves_omitted_fields() -> None:

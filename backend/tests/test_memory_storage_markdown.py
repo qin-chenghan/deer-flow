@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from deerflow.agents.memory.backends.deermem.deer_mem import DeerMem
 from deerflow.agents.memory.backends.deermem.deermem.config import DeerMemConfig
 from deerflow.agents.memory.backends.deermem.deermem.core import storage as storage_module
 from deerflow.agents.memory.backends.deermem.deermem.core.paths import fact_file_path
@@ -337,15 +338,104 @@ def test_concurrent_legacy_agent_migration_is_idempotent(tmp_path: Path) -> None
     assert not legacy_path.exists()
 
 
-def test_global_legacy_facts_require_explicit_migration(storage: FileMemoryStorage) -> None:
+def test_default_manager_read_auto_migrates_global_legacy_facts(storage: FileMemoryStorage, tmp_path: Path) -> None:
     path = storage._get_memory_file_path(user_id="alice")
     path.parent.mkdir(parents=True)
-    path.write_text(json.dumps(_memory_with_fact("unowned")), encoding="utf-8")
+    legacy = _memory_with_fact("old global fact")
+    legacy["user"]["workContext"] = {"summary": "keep global profile", "updatedAt": "2026-01-01T00:00:00Z"}
+    path.write_text(json.dumps(legacy), encoding="utf-8")
 
-    with pytest.raises(MemoryStorageCorruption, match="explicit migrate"):
-        storage.load("agent-a", user_id="alice")
+    manager = DeerMem(backend_config={"storage_path": str(tmp_path)})
+    loaded = manager.get_memory(user_id="alice")
+    loaded_again = manager.reload_memory(user_id="alice")
 
-    assert json.loads(path.read_text(encoding="utf-8"))["facts"][0]["content"] == "unowned"
+    assert [fact["content"] for fact in loaded["facts"]] == ["old global fact"]
+    assert [fact["content"] for fact in loaded_again["facts"]] == ["old global fact"]
+    persisted = json.loads(path.read_text(encoding="utf-8"))
+    assert "facts" not in persisted
+    assert persisted["user"]["workContext"]["summary"] == "keep global profile"
+    assert fact_file_path(path, "fact_01HZZZZZZZZZZZZZZZZZZZZZZZ", agent_name="__default__").exists()
+
+
+@pytest.mark.parametrize("custom_first", [True, False])
+def test_default_bucket_is_isolated_from_custom_lead_agent(tmp_path: Path, custom_first: bool) -> None:
+    manager = DeerMem(backend_config={"storage_path": str(tmp_path)})
+    custom_dir = tmp_path / "users" / "alice" / "agents" / "lead-agent"
+    custom_dir.mkdir(parents=True)
+    (custom_dir / "config.yaml").write_text("name: lead-agent\n", encoding="utf-8")
+
+    if custom_first:
+        manager.create_fact("custom fact", agent_name="lead-agent", user_id="alice")
+        manager.create_fact("default fact", user_id="alice")
+    else:
+        manager.create_fact("default fact", user_id="alice")
+        manager.create_fact("custom fact", agent_name="lead-agent", user_id="alice")
+
+    assert [fact["content"] for fact in manager.get_memory(user_id="alice")["facts"]] == ["default fact"]
+    assert [fact["content"] for fact in manager.get_memory(agent_name="lead-agent", user_id="alice")["facts"]] == ["custom fact"]
+    assert list((tmp_path / "users" / "alice" / "agents" / "__default__" / "facts").glob("**/*.md"))
+    assert list((tmp_path / "users" / "alice" / "agents" / "lead-agent" / "facts").glob("**/*.md"))
+
+
+def test_old_implicit_lead_agent_bucket_moves_to_reserved_default(tmp_path: Path) -> None:
+    config = DeerMemConfig(storage_path=str(tmp_path))
+    old_storage = FileMemoryStorage(config)
+    old_storage.upsert_fact(
+        _memory_with_fact("fact written by the previous PR version")["facts"][0],
+        user_id="alice",
+        agent_name="lead-agent",
+        expected_revision=0,
+    )
+
+    manager = DeerMem(backend_config={"storage_path": str(tmp_path)})
+    loaded = manager.get_memory(user_id="alice")
+
+    assert [fact["content"] for fact in loaded["facts"]] == ["fact written by the previous PR version"]
+    assert not (tmp_path / "users" / "alice" / "agents" / "lead-agent").exists()
+    assert list((tmp_path / "users" / "alice" / "agents" / "__default__" / "facts").glob("**/*.md"))
+
+
+def test_old_implicit_bucket_with_unknown_files_is_preserved(tmp_path: Path) -> None:
+    legacy_dir = tmp_path / "users" / "alice" / "agents" / "lead-agent"
+    legacy_dir.mkdir(parents=True)
+    unknown = legacy_dir / "SOUL.md"
+    unknown.write_text("possibly a partially created custom agent", encoding="utf-8")
+    manager = DeerMem(backend_config={"storage_path": str(tmp_path)})
+
+    with pytest.raises(MemoryStorageCorruption, match="unexpected entries"):
+        manager.get_memory(user_id="alice")
+
+    assert unknown.read_text(encoding="utf-8") == "possibly a partially created custom agent"
+
+
+def test_create_returns_fresh_full_view_after_disjoint_rebase(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = DeerMem(backend_config={"storage_path": str(tmp_path)})
+    competing_storage = FileMemoryStorage(manager._config)
+    real_apply_changes = manager._storage.apply_changes
+    injected = False
+
+    def apply_with_competing_create(change_set, **scope):
+        nonlocal injected
+        if not injected:
+            injected = True
+            competing_fact = _memory_with_fact("competing fact")["facts"][0]
+            competing_fact["id"] = "fact_competing"
+            competing_storage.apply_changes(
+                {"upserts": [competing_fact], "upsertRevisions": {"fact_competing": None}},
+                agent_name=scope["agent_name"],
+                user_id=scope["user_id"],
+                expected_manifest_revision=scope["expected_manifest_revision"],
+            )
+        return real_apply_changes(change_set, **scope)
+
+    monkeypatch.setattr(manager._storage, "apply_changes", apply_with_competing_create)
+
+    returned, created_id = manager.create_fact("requested fact", user_id="alice")
+    fresh = manager.reload_memory(user_id="alice")
+
+    assert created_id is not None
+    assert {fact["id"] for fact in returned["facts"]} == {fact["id"] for fact in fresh["facts"]}
+    assert {fact["content"] for fact in returned["facts"]} == {"competing fact", "requested fact"}
 
 
 def test_agent_fact_scope_must_match_requested_directory(storage: FileMemoryStorage) -> None:

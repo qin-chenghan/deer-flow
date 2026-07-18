@@ -36,6 +36,7 @@ from .deermem.core.message_processing import (
     detect_reinforcement,
     filter_messages_for_memory,
 )
+from .deermem.core.paths import DEFAULT_AGENT_BUCKET
 from .deermem.core.prompt import format_memory_for_injection, warm_tiktoken_cache
 from .deermem.core.queue import MemoryUpdateQueue
 from .deermem.core.storage import create_storage
@@ -43,14 +44,9 @@ from .deermem.core.updater import MemoryUpdater, _coerce_source_confidence
 
 logger = logging.getLogger(__name__)
 
-# Filesystem-safe memory bucket for DeerFlow's built-in lead agent. Existing
-# middleware/API callers omit agent_name, while Markdown facts require an agent
-# directory, so DeerMem resolves that legacy None at its manager boundary.
-DEFAULT_MEMORY_AGENT_NAME = "lead-agent"
-
 
 def _resolve_agent_name(agent_name: str | None) -> str:
-    return agent_name or DEFAULT_MEMORY_AGENT_NAME
+    return agent_name or DEFAULT_AGENT_BUCKET
 
 
 class DeerMem(MemoryManager):

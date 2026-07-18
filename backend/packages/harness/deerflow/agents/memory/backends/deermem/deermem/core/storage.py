@@ -30,7 +30,7 @@ from typing import Any, Protocol
 import yaml
 
 from ..config import DeerMemConfig
-from .paths import agent_facts_directory, fact_file_path, memory_file_path
+from .paths import DEFAULT_AGENT_BUCKET, agent_facts_directory, fact_file_path, memory_file_path
 
 logger = logging.getLogger(__name__)
 
@@ -445,6 +445,99 @@ class FileMemoryStorage(MemoryStorage):
     def _legacy_agent_memory_path(self, path: Path, agent_name: str) -> Path:
         return path.parent / "agents" / agent_name.lower() / path.name
 
+    def _global_json_needs_migration(self, path: Path) -> bool:
+        memory_file = self._load_memory_file(path)
+        return memory_file is not None and ("facts" in memory_file or memory_file.get("version") != DOCUMENT_VERSION)
+
+    def _migrate_previous_default_bucket_locked(self, path: Path, *, user_id: str | None) -> bool:
+        """Move facts written by the earlier ``lead-agent`` default mapping.
+
+        A real custom ``lead-agent`` owns a ``config.yaml`` and is never
+        touched.  A directory with any other unexpected file is also preserved
+        and rejected instead of being guessed at or recursively deleted.
+        """
+        legacy_agent_name = "lead-agent"
+        legacy_agent_dir = path.parent / "agents" / legacy_agent_name
+        if not legacy_agent_dir.exists() or (legacy_agent_dir / "config.yaml").is_file():
+            return False
+        unexpected = [child for child in legacy_agent_dir.iterdir() if child.name != "facts"]
+        legacy_facts_dir = legacy_agent_dir / "facts"
+        if legacy_facts_dir.exists():
+            unexpected.extend(child for child in legacy_facts_dir.glob("**/*") if child.is_file() and child.suffix.lower() != ".md")
+        if unexpected:
+            names = ", ".join(sorted(child.name for child in unexpected))
+            raise MemoryStorageCorruption(f"Cannot migrate previous default bucket {legacy_agent_dir}: unexpected entries {names}")
+
+        legacy_facts = self._load_agent_facts(path, legacy_agent_name, user_id=user_id)
+        upserts: list[dict[str, Any]] = []
+        for legacy_fact in legacy_facts:
+            candidate = _normalize_fact(legacy_fact, scope=_scope_dict(user_id, DEFAULT_AGENT_BUCKET))
+            existing, _ = self._read_fact(
+                path,
+                candidate["id"],
+                user_id=user_id,
+                agent_name=DEFAULT_AGENT_BUCKET,
+            )
+            if existing is not None:
+                if not self._migration_equivalent(candidate, existing):
+                    raise MemoryStorageCorruption(f"Fact migration conflict for {candidate['id']!r}")
+                continue
+            upserts.append(candidate)
+
+        current_memory = self._load_memory_file(path)
+        self._commit_changes_locked(
+            path,
+            user_id=user_id,
+            agent_name=DEFAULT_AGENT_BUCKET,
+            upserts=upserts,
+            deletes=[],
+            summaries=None,
+            expected_revision=int((current_memory or {}).get("revision") or 0),
+        )
+        # Delete only the source Markdown files that were parsed above. Never
+        # recursively remove this directory: if an unexpected file appears
+        # concurrently, the final rmdir simply leaves it in place.
+        for fact_path in legacy_facts_dir.glob("**/*.md"):
+            fact_path.unlink(missing_ok=True)
+        directories = sorted(
+            (child for child in legacy_agent_dir.glob("**/*") if child.is_dir()),
+            key=lambda child: len(child.parts),
+            reverse=True,
+        )
+        for directory in directories:
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+        try:
+            legacy_agent_dir.rmdir()
+        except OSError:
+            pass
+        return True
+
+    def _run_read_migrations_locked(
+        self,
+        path: Path,
+        agent_name: str | None,
+        *,
+        user_id: str | None,
+    ) -> None:
+        """Finish journal recovery and all migrations reachable from reads."""
+        self._recover_if_needed(path)
+        if self._global_json_needs_migration(path):
+            self._migrate_locked(
+                path,
+                DEFAULT_AGENT_BUCKET,
+                user_id=user_id,
+                include_global=True,
+            )
+        if agent_name is not None:
+            legacy_path = self._legacy_agent_memory_path(path, agent_name)
+            if legacy_path.exists():
+                self._migrate_locked(path, agent_name, user_id=user_id, include_global=False)
+        if agent_name == DEFAULT_AGENT_BUCKET:
+            self._migrate_previous_default_bucket_locked(path, user_id=user_id)
+
     @staticmethod
     def _migration_equivalent(left: dict[str, Any], right: dict[str, Any]) -> bool:
         ignored = {"revision", "createdAt", "updatedAt", "scope", "title", "schemaVersion"}
@@ -771,11 +864,16 @@ class FileMemoryStorage(MemoryStorage):
         key = self._cache_key(agent_name, user_id=user_id)
         journal_path = path.parent / ".memory.journal.json"
         legacy_path = self._legacy_agent_memory_path(path, agent_name) if agent_name is not None else None
-        if journal_path.exists() or (legacy_path is not None and legacy_path.exists()):
+        previous_default_dir = path.parent / "agents" / "lead-agent"
+        needs_migration = (
+            journal_path.exists()
+            or (legacy_path is not None and legacy_path.exists())
+            or self._global_json_needs_migration(path)
+            or (agent_name == DEFAULT_AGENT_BUCKET and previous_default_dir.exists() and not (previous_default_dir / "config.yaml").is_file())
+        )
+        if needs_migration:
             with self._scope_lock(key), _process_file_lock(path.parent / ".memory.lock", float(getattr(self._config, "file_lock_timeout_seconds", 10))):
-                self._recover_if_needed(path)
-                if agent_name is not None:
-                    self._migrate_locked(path, agent_name, user_id=user_id, include_global=False)
+                self._run_read_migrations_locked(path, agent_name, user_id=user_id)
         signature = self._scope_signature(path, agent_name)
         with self._cache_lock:
             cached = self._memory_cache.get(key)
@@ -790,11 +888,16 @@ class FileMemoryStorage(MemoryStorage):
         path = self._get_memory_file_path(agent_name, user_id=user_id)
         key = self._cache_key(agent_name, user_id=user_id)
         legacy_path = self._legacy_agent_memory_path(path, agent_name) if agent_name is not None else None
-        if (path.parent / ".memory.journal.json").exists() or (legacy_path is not None and legacy_path.exists()):
+        previous_default_dir = path.parent / "agents" / "lead-agent"
+        needs_migration = (
+            (path.parent / ".memory.journal.json").exists()
+            or (legacy_path is not None and legacy_path.exists())
+            or self._global_json_needs_migration(path)
+            or (agent_name == DEFAULT_AGENT_BUCKET and previous_default_dir.exists() and not (previous_default_dir / "config.yaml").is_file())
+        )
+        if needs_migration:
             with self._scope_lock(key), _process_file_lock(path.parent / ".memory.lock", float(getattr(self._config, "file_lock_timeout_seconds", 10))):
-                self._recover_if_needed(path)
-                if agent_name is not None:
-                    self._migrate_locked(path, agent_name, user_id=user_id, include_global=False)
+                self._run_read_migrations_locked(path, agent_name, user_id=user_id)
         document = self._read_document(path, agent_name, user_id=user_id)
         signature = self._scope_signature(path, agent_name)
         with self._cache_lock:
