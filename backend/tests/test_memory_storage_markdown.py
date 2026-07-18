@@ -199,9 +199,10 @@ def test_prepared_journal_restores_previous_manifest_and_fact(storage: FileMemor
 def test_fact_repository_applies_upsert_and_physical_delete(storage: FileMemoryStorage) -> None:
     first = storage.upsert_fact(_memory_with_fact()["facts"][0], user_id="alice", agent_name="agent-a", expected_revision=0)
     assert first["revision"] == 1
+    assert first["complete"] is False
     assert storage.get_fact("fact_01HZZZZZZZZZZZZZZZZZZZZZZZ", user_id="alice", agent_name="agent-a")["content"] == "Project uses Python 3.12"
 
-    updated = copy.deepcopy(first["facts"][0])
+    updated = copy.deepcopy(first["upsertedFacts"][0])
     updated["content"] = "Project uses Python 3.13"
     second = storage.apply_changes(
         {"upserts": [updated]},
@@ -209,13 +210,13 @@ def test_fact_repository_applies_upsert_and_physical_delete(storage: FileMemoryS
         agent_name="agent-a",
         expected_manifest_revision=1,
     )
-    assert second["facts"][0]["content"] == "Project uses Python 3.13"
+    assert second["upsertedFacts"][0]["content"] == "Project uses Python 3.13"
 
     memory_path = storage._get_memory_file_path("agent-a", user_id="alice")
     fact_path = fact_file_path(memory_path, updated["id"], agent_name="agent-a")
     assert fact_path.exists()
     third = storage.delete_fact(updated["id"], user_id="alice", agent_name="agent-a", expected_revision=2)
-    assert third["facts"] == []
+    assert third["deletedFactIds"] == [updated["id"]]
     assert not fact_path.exists()
 
 
@@ -393,12 +394,12 @@ def test_fact_schema_rejects_invalid_collection_and_revision_types(storage: File
 
 def test_changed_fact_increments_revision_and_updated_at(storage: FileMemoryStorage) -> None:
     created = storage.upsert_fact(_memory_with_fact()["facts"][0], user_id="alice", agent_name="agent-a", expected_revision=0)
-    original = created["facts"][0]
+    original = created["upsertedFacts"][0]
     updated = copy.deepcopy(original)
     updated["content"] = "Project uses Python 3.13"
 
     result = storage.apply_changes({"upserts": [updated]}, user_id="alice", agent_name="agent-a", expected_manifest_revision=1)
-    changed = result["facts"][0]
+    changed = result["upsertedFacts"][0]
 
     assert changed["revision"] == original["revision"] + 1
     assert changed["updatedAt"] > original["updatedAt"]
@@ -469,7 +470,35 @@ def test_incremental_change_does_not_scan_all_fact_files(storage: FileMemoryStor
         expected_manifest_revision=1,
     )
 
-    assert next(fact for fact in result["facts"] if fact["id"] == first["id"])["content"] == "first changed"
+    assert result["complete"] is False
+    assert [fact["id"] for fact in result["upsertedFacts"]] == [first["id"]]
+    assert result["upsertedFacts"][0]["content"] == "first changed"
+
+
+def test_fresh_storage_incremental_result_does_not_hide_untouched_sibling(tmp_path: Path) -> None:
+    config = DeerMemConfig(storage_path=str(tmp_path))
+    writer = FileMemoryStorage(config)
+    memory = create_empty_memory()
+    first = _memory_with_fact("first")["facts"][0]
+    second = copy.deepcopy(first)
+    second.update({"id": "fact_second", "content": "second"})
+    memory["facts"] = [first, second]
+    assert writer.save(memory, "agent-a", user_id="alice")
+
+    fresh = FileMemoryStorage(config)
+    changed = copy.deepcopy(fresh.get_fact(first["id"], user_id="alice", agent_name="agent-a"))
+    changed["content"] = "first changed"
+    result = fresh.apply_changes(
+        {"upserts": [changed]},
+        user_id="alice",
+        agent_name="agent-a",
+        expected_manifest_revision=1,
+    )
+
+    assert result["complete"] is False
+    assert [fact["id"] for fact in result["upsertedFacts"]] == [first["id"]]
+    reloaded = fresh.load("agent-a", user_id="alice")
+    assert {fact["content"] for fact in reloaded["facts"]} == {"first changed", "second"}
 
 
 def test_stale_user_revision_rebases_disjoint_fact_change_but_not_same_fact(storage: FileMemoryStorage) -> None:
@@ -487,7 +516,8 @@ def test_stale_user_revision_rebases_disjoint_fact_change_but_not_same_fact(stor
 
     storage.apply_changes({"upserts": [first_update]}, user_id="alice", agent_name="agent-a", expected_manifest_revision=1)
     rebased = storage.apply_changes({"upserts": [second_update]}, user_id="alice", agent_name="agent-a", expected_manifest_revision=1)
-    assert {fact["content"] for fact in rebased["facts"]} == {"first changed", "second changed"}
+    assert [fact["content"] for fact in rebased["upsertedFacts"]] == ["second changed"]
+    assert {fact["content"] for fact in storage.load("agent-a", user_id="alice")["facts"]} == {"first changed", "second changed"}
 
     first_update["content"] = "stale overwrite"
     with pytest.raises(MemoryRevisionConflict):
@@ -529,6 +559,90 @@ def test_migrate_reports_legacy_agent_file(storage: FileMemoryStorage) -> None:
 
     assert report["migrated"] is True
     assert not legacy_path.exists()
+
+
+def test_migrate_preserves_legacy_summaries_before_deleting_agent_file(storage: FileMemoryStorage) -> None:
+    memory_path = storage._get_memory_file_path("agent-a", user_id="alice")
+    legacy_path = memory_path.parent / "agents" / "agent-a" / "memory.json"
+    legacy_path.parent.mkdir(parents=True)
+    legacy = _memory_with_fact("legacy")
+    legacy["user"]["workContext"] = {"summary": "legacy profile", "updatedAt": "2026-01-01T00:00:00Z"}
+    legacy["history"]["recentMonths"] = {"summary": "legacy history", "updatedAt": "2026-01-01T00:00:00Z"}
+    legacy_path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    storage.migrate(user_id="alice", agent_name="agent-a")
+
+    global_memory = storage.load(user_id="alice")
+    assert global_memory["user"]["workContext"]["summary"] == "legacy profile"
+    assert global_memory["history"]["recentMonths"]["summary"] == "legacy history"
+    assert not legacy_path.exists()
+
+
+def test_migrate_keeps_legacy_file_when_summary_conflicts(storage: FileMemoryStorage) -> None:
+    global_memory = create_empty_memory()
+    global_memory["user"]["workContext"] = {"summary": "canonical profile", "updatedAt": "now"}
+    assert storage.save(global_memory, user_id="alice")
+    memory_path = storage._get_memory_file_path("agent-a", user_id="alice")
+    legacy_path = memory_path.parent / "agents" / "agent-a" / "memory.json"
+    legacy_path.parent.mkdir(parents=True)
+    legacy = _memory_with_fact("legacy")
+    legacy["user"]["workContext"] = {"summary": "different profile", "updatedAt": "then"}
+    legacy_path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    with pytest.raises(MemoryStorageCorruption, match="summary migration conflict"):
+        storage.migrate(user_id="alice", agent_name="agent-a")
+
+    assert legacy_path.exists()
+    assert not fact_file_path(memory_path, legacy["facts"][0]["id"], agent_name="agent-a").exists()
+
+
+def test_two_storage_instances_cannot_create_the_same_fact_id(tmp_path: Path) -> None:
+    config = DeerMemConfig(storage_path=str(tmp_path))
+    first_storage = FileMemoryStorage(config)
+    second_storage = FileMemoryStorage(config)
+    new_fact = _memory_with_fact("first writer")["facts"][0]
+    new_fact.pop("revision")
+
+    first_storage.apply_changes(
+        {"upserts": [copy.deepcopy(new_fact)]},
+        user_id="alice",
+        agent_name="agent-a",
+        expected_manifest_revision=0,
+    )
+    competing = copy.deepcopy(new_fact)
+    competing["content"] = "second writer"
+
+    with pytest.raises(MemoryRevisionConflict, match="must not already exist"):
+        second_storage.apply_changes(
+            {"upserts": [competing]},
+            user_id="alice",
+            agent_name="agent-a",
+            expected_manifest_revision=0,
+        )
+
+    stored = first_storage.get_fact(new_fact["id"], user_id="alice", agent_name="agent-a")
+    assert stored["content"] == "first writer"
+
+
+def test_stale_summary_change_is_not_rebased_over_newer_summary(storage: FileMemoryStorage) -> None:
+    newer = create_empty_memory()
+    newer["user"]["workContext"] = {"summary": "newer", "updatedAt": "now"}
+    assert storage.save(newer, user_id="alice", expected_revision=0)
+    stale = create_empty_memory()
+    stale["user"]["workContext"] = {"summary": "stale", "updatedAt": "before"}
+    fact = _memory_with_fact("should not be committed")["facts"][0]
+    fact.pop("revision")
+
+    with pytest.raises(MemoryRevisionConflict):
+        storage.apply_changes(
+            {"upserts": [fact], "upsertRevisions": {fact["id"]: None}, "summaries": {"user": stale["user"], "history": stale["history"]}},
+            user_id="alice",
+            agent_name="agent-a",
+            expected_manifest_revision=0,
+        )
+
+    assert storage.load(user_id="alice")["user"]["workContext"]["summary"] == "newer"
+    assert not fact_file_path(storage._get_memory_file_path("agent-a", user_id="alice"), fact["id"], agent_name="agent-a").exists()
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows append-mode lock behavior")

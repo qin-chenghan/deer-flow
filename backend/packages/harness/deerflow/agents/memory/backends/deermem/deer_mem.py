@@ -43,6 +43,15 @@ from .deermem.core.updater import MemoryUpdater, _coerce_source_confidence
 
 logger = logging.getLogger(__name__)
 
+# Filesystem-safe memory bucket for DeerFlow's built-in lead agent. Existing
+# middleware/API callers omit agent_name, while Markdown facts require an agent
+# directory, so DeerMem resolves that legacy None at its manager boundary.
+DEFAULT_MEMORY_AGENT_NAME = "lead-agent"
+
+
+def _resolve_agent_name(agent_name: str | None) -> str:
+    return agent_name or DEFAULT_MEMORY_AGENT_NAME
+
 
 class DeerMem(MemoryManager):
     """Default memory backend: file-backed facts + debounced LLM extraction."""
@@ -87,7 +96,7 @@ class DeerMem(MemoryManager):
         self._queue.add(
             thread_id=thread_id,
             messages=filtered,
-            agent_name=agent_name,
+            agent_name=_resolve_agent_name(agent_name),
             user_id=user_id,
             trace_id=trace_id,
             correction_detected=correction_detected,
@@ -114,7 +123,7 @@ class DeerMem(MemoryManager):
         self._queue.add_nowait(
             thread_id=thread_id,
             messages=filtered,
-            agent_name=agent_name,
+            agent_name=_resolve_agent_name(agent_name),
             user_id=user_id,
             correction_detected=correction_detected,
             reinforcement_detected=reinforcement_detected,
@@ -158,7 +167,7 @@ class DeerMem(MemoryManager):
         ``injection_enabled`` gate and the ``<memory>`` wrapping stay at the
         call site (``_get_memory_context``); this returns only the body.
         """
-        memory_data = self._updater.get_memory_data(agent_name=agent_name, user_id=user_id)
+        memory_data = self._updater.get_memory_data(agent_name=_resolve_agent_name(agent_name), user_id=user_id)
         return format_memory_for_injection(
             memory_data,
             max_tokens=self._config.max_injection_tokens,
@@ -190,7 +199,8 @@ class DeerMem(MemoryManager):
             return []
         query_lower = query.strip().lower()
         search_facts = getattr(self._storage, "search_facts", None)
-        scopes = [{"userId": user_id, "agentName": agent_name}]
+        resolved_agent_name = _resolve_agent_name(agent_name)
+        scopes = [{"userId": user_id, "agentName": resolved_agent_name}]
         indexed = (
             search_facts(
                 query,
@@ -204,7 +214,7 @@ class DeerMem(MemoryManager):
         )
         if indexed:
             return [copy.deepcopy(result.get("fact", result)) for result in indexed]
-        memory_data = self._updater.get_memory_data(agent_name=agent_name, user_id=user_id)
+        memory_data = self._updater.get_memory_data(agent_name=resolved_agent_name, user_id=user_id)
         matched = [fact for fact in memory_data.get("facts", []) if isinstance(fact.get("content"), str) and query_lower in fact["content"].lower() and (category is None or fact.get("category") == category)]
         matched.sort(key=_coerce_source_confidence, reverse=True)
         return matched[:top_k]
@@ -216,7 +226,7 @@ class DeerMem(MemoryManager):
         user_id: str | None = None,
         agent_name: str | None = None,
     ) -> dict[str, Any]:
-        return self._updater.get_memory_data(agent_name=agent_name, user_id=user_id)
+        return self._updater.get_memory_data(agent_name=_resolve_agent_name(agent_name), user_id=user_id)
 
     def delete_memory(
         self,
@@ -233,7 +243,7 @@ class DeerMem(MemoryManager):
         user_id: str | None = None,
         agent_name: str | None = None,
     ) -> dict[str, Any]:
-        return self._updater.clear_memory_data(agent_name=agent_name, user_id=user_id)
+        return self._updater.clear_memory_data(agent_name=_resolve_agent_name(agent_name), user_id=user_id)
 
     def import_memory(
         self,
@@ -242,7 +252,7 @@ class DeerMem(MemoryManager):
         user_id: str | None = None,
         agent_name: str | None = None,
     ) -> dict[str, Any]:
-        return self._updater.import_memory_data(memory_data, agent_name=agent_name, user_id=user_id)
+        return self._updater.import_memory_data(memory_data, agent_name=_resolve_agent_name(agent_name), user_id=user_id)
 
     def export_memory(
         self,
@@ -289,7 +299,7 @@ class DeerMem(MemoryManager):
         agent_name: str | None = None,
     ) -> dict[str, Any]:
         """Drop the cached memory document and reload from disk."""
-        return self._updater.reload_memory_data(agent_name=agent_name, user_id=user_id)
+        return self._updater.reload_memory_data(agent_name=_resolve_agent_name(agent_name), user_id=user_id)
 
     def create_fact(
         self,
@@ -304,7 +314,7 @@ class DeerMem(MemoryManager):
             content,
             category=category,
             confidence=confidence,
-            agent_name=agent_name,
+            agent_name=_resolve_agent_name(agent_name),
             user_id=user_id,
         )
 
@@ -315,7 +325,7 @@ class DeerMem(MemoryManager):
         agent_name: str | None = None,
         user_id: str | None = None,
     ) -> dict[str, Any]:
-        return self._updater.delete_memory_fact(fact_id, agent_name=agent_name, user_id=user_id)
+        return self._updater.delete_memory_fact(fact_id, agent_name=_resolve_agent_name(agent_name), user_id=user_id)
 
     def update_fact(
         self,
@@ -332,6 +342,6 @@ class DeerMem(MemoryManager):
             content=content,
             category=category,
             confidence=confidence,
-            agent_name=agent_name,
+            agent_name=_resolve_agent_name(agent_name),
             user_id=user_id,
         )

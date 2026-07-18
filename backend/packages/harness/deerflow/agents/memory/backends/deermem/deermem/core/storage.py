@@ -84,6 +84,24 @@ def create_empty_memory() -> dict[str, Any]:
     }
 
 
+def _has_meaningful_data(value: Any) -> bool:
+    """Return whether a legacy summary value contains anything worth preserving."""
+    if isinstance(value, dict):
+        return any(_has_meaningful_data(item) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return any(_has_meaningful_data(item) for item in value)
+    return value not in (None, "", False)
+
+
+def _merge_legacy_summary_section(*, canonical: Any, legacy: Any, section: str, legacy_path: Path) -> Any:
+    """Adopt a legacy section only when doing so cannot overwrite live data."""
+    if canonical == legacy or not _has_meaningful_data(legacy):
+        return copy.deepcopy(canonical)
+    if not _has_meaningful_data(canonical):
+        return copy.deepcopy(legacy)
+    raise MemoryStorageCorruption(f"Legacy {section} summary migration conflict in {legacy_path}; the legacy file was kept")
+
+
 def _scope_dict(user_id: str | None, agent_name: str | None) -> dict[str, str | None]:
     return {"userId": user_id, "agentName": agent_name}
 
@@ -502,6 +520,7 @@ class FileMemoryStorage(MemoryStorage):
         summaries: dict[str, Any] | None,
         expected_revision: int | None,
         delete_revisions: dict[str, int] | None = None,
+        upsert_revisions: dict[str, int | None] | None = None,
     ) -> tuple[dict[str, Any], list[tuple[str, dict[str, Any] | str, str | None]]]:
         """Commit only the addressed fact files plus the shared summary JSON.
 
@@ -529,6 +548,14 @@ class FileMemoryStorage(MemoryStorage):
             if agent_name is None:  # guarded above
                 raise ValueError("agent_name is required for fact repository changes")
             existing, fact_path = self._read_fact(path, fact_id, user_id=user_id, agent_name=agent_name)
+            if upsert_revisions is not None and fact_id in upsert_revisions:
+                expected_fact_revision = upsert_revisions[fact_id]
+                if expected_fact_revision is None and existing is not None:
+                    raise MemoryRevisionConflict(f"Fact {fact_id!r} must not already exist")
+                if expected_fact_revision is not None:
+                    actual_fact_revision = None if existing is None else existing.get("revision")
+                    if actual_fact_revision != expected_fact_revision:
+                        raise MemoryRevisionConflict(f"Expected fact {fact_id!r} revision {expected_fact_revision}, found {actual_fact_revision}")
             normalized = _normalize_fact(candidate, scope=scope, existing=existing)
             if existing != normalized:
                 prepared[fact_id] = (normalized, existing, fact_path)
@@ -553,8 +580,6 @@ class FileMemoryStorage(MemoryStorage):
         user_section = copy.deepcopy(base.get("user", {}))
         history_section = copy.deepcopy(base.get("history", {}))
         if summaries is not None:
-            if agent_name is not None:
-                raise ValueError("Only global writes may update user/history summaries")
             if not isinstance(summaries, dict):
                 raise ValueError("change_set.summaries must be an object")
             if "user" in summaries:
@@ -640,6 +665,20 @@ class FileMemoryStorage(MemoryStorage):
         if not sources:
             return False, from_version
 
+        base = global_memory or create_empty_memory()
+        migrated_summaries = {
+            "user": copy.deepcopy(base.get("user", {})),
+            "history": copy.deepcopy(base.get("history", {})),
+        }
+        if legacy_memory is not None:
+            for section in ("user", "history"):
+                migrated_summaries[section] = _merge_legacy_summary_section(
+                    canonical=migrated_summaries[section],
+                    legacy=legacy_memory.get(section, {}),
+                    section=section,
+                    legacy_path=legacy_path,
+                )
+
         upserts: list[dict[str, Any]] = []
         pending: dict[str, dict[str, Any]] = {}
         for source_path, source_memory in sources:
@@ -674,7 +713,7 @@ class FileMemoryStorage(MemoryStorage):
             agent_name=agent_name,
             upserts=upserts,
             deletes=[],
-            summaries=None,
+            summaries=migrated_summaries,
             expected_revision=current_revision,
         )
         if legacy_memory is not None:
@@ -907,29 +946,49 @@ class FileMemoryStorage(MemoryStorage):
         agent_name: str | None = None,
         expected_manifest_revision: int | None = None,
     ) -> dict[str, Any]:
-        """Commit an incremental change set without materializing all facts."""
+        """Commit an incremental change set and return only the applied delta.
+
+        ``complete`` is deliberately false: callers that require the historical
+        full document must explicitly call ``load``.  This prevents a fresh
+        process from presenting a one-fact cache snapshot as the whole agent
+        memory while keeping the mutation path free of full fact scans.
+        """
         has_fact_changes = bool(change_set.get("upserts") or change_set.get("deletes"))
         if has_fact_changes and agent_name is None:
             raise ValueError("agent_name is required for fact repository changes")
         summaries = change_set.get("summaries")
-        if summaries is not None and agent_name is not None:
-            raise ValueError("Agent fact changes cannot update global summaries")
-        upserts = change_set.get("upserts", [])
+        upserts = copy.deepcopy(change_set.get("upserts", []))
         deletes = change_set.get("deletes", [])
         delete_revisions = change_set.get("deleteRevisions")
+        upsert_revisions = change_set.get("upsertRevisions")
         if not isinstance(upserts, list) or not isinstance(deletes, list):
             raise ValueError("change_set.upserts and change_set.deletes must be lists")
         if delete_revisions is not None and not isinstance(delete_revisions, dict):
             raise ValueError("change_set.deleteRevisions must be an object")
+        if upsert_revisions is not None and not isinstance(upsert_revisions, dict):
+            raise ValueError("change_set.upsertRevisions must be an object")
+
+        normalized_upsert_revisions: dict[str, int | None] = {}
+        for incoming in upserts:
+            if not isinstance(incoming, dict):
+                raise ValueError("change_set.upserts must contain fact objects")
+            incoming["id"] = str(incoming.get("id") or f"fact_{uuid.uuid4().hex}")
+            fact_id = incoming["id"]
+            if isinstance(upsert_revisions, dict) and fact_id in upsert_revisions:
+                expected_fact_revision = upsert_revisions[fact_id]
+            else:
+                expected_fact_revision = incoming.get("revision") if "revision" in incoming else None
+            if expected_fact_revision is not None and (isinstance(expected_fact_revision, bool) or not isinstance(expected_fact_revision, int) or expected_fact_revision < 1):
+                raise ValueError("change_set.upsertRevisions values must be null or integers >= 1")
+            normalized_upsert_revisions[fact_id] = expected_fact_revision
 
         path = self._get_memory_file_path(agent_name, user_id=user_id)
         key = self._cache_key(agent_name, user_id=user_id)
-        with self._cache_lock:
-            cached_before = copy.deepcopy(self._memory_cache.get(key, (None, ()))[0])
         expected = expected_manifest_revision
         notifications: list[tuple[str, dict[str, Any] | str, str | None]] = []
         memory_file: dict[str, Any] | None = None
         safe_delete_rebase = not deletes or (isinstance(delete_revisions, dict) and all(str(fact_id) in delete_revisions for fact_id in deletes))
+        safe_upsert_rebase = all(str(incoming["id"]) in normalized_upsert_revisions for incoming in upserts)
         for attempt in range(3):
             try:
                 with self._scope_lock(key), _process_file_lock(path.parent / ".memory.lock", float(getattr(self._config, "file_lock_timeout_seconds", 10))):
@@ -938,15 +997,17 @@ class FileMemoryStorage(MemoryStorage):
                         path,
                         user_id=user_id,
                         agent_name=agent_name,
-                        upserts=copy.deepcopy(upserts),
+                        upserts=upserts,
                         deletes=[str(fact_id) for fact_id in deletes],
                         summaries=copy.deepcopy(summaries),
                         expected_revision=expected,
                         delete_revisions=copy.deepcopy(delete_revisions),
+                        upsert_revisions=normalized_upsert_revisions,
                     )
                 break
             except MemoryRevisionConflict as exc:
-                can_rebase = has_fact_changes and summaries is None and safe_delete_rebase and attempt < 2
+                manifest_conflict = str(exc).startswith("Expected user-memory revision ")
+                can_rebase = manifest_conflict and has_fact_changes and summaries is None and safe_delete_rebase and safe_upsert_rebase and attempt < 2
                 if not can_rebase:
                     raise
                 current = self._load_memory_file(path)
@@ -964,29 +1025,14 @@ class FileMemoryStorage(MemoryStorage):
                     logger.exception("Retrieval notification failed for %s", value)
         if memory_file is None:  # defensive: the bounded loop either commits or raises
             raise MemoryStorageError("Memory repository change did not produce a result")
-        result = (
-            cached_before
-            if isinstance(cached_before, dict)
-            else {
-                **copy.deepcopy(memory_file),
-                "facts": [],
-            }
-        )
-        for key_name in ("version", "revision", "lastUpdated", "user", "history"):
-            if key_name in memory_file:
-                result[key_name] = copy.deepcopy(memory_file[key_name])
-        by_id = {str(fact.get("id")): copy.deepcopy(fact) for fact in result.get("facts", []) if isinstance(fact, dict)}
-        for action, value, _ in notifications:
-            if action == "upsert" and isinstance(value, dict):
-                by_id[str(value["id"])] = copy.deepcopy(value)
-            elif action == "remove":
-                by_id.pop(str(value), None)
-        result["facts"] = list(by_id.values()) if agent_name is not None else []
-        # Keep an incremental snapshot for a following change set, but mark its
-        # disk signature unknown so a normal load still validates the files.
-        with self._cache_lock:
-            self._memory_cache[key] = (copy.deepcopy(result), ())
-        return result
+        return {
+            "complete": False,
+            "version": memory_file.get("version", DOCUMENT_VERSION),
+            "revision": memory_file.get("revision", 0),
+            "lastUpdated": memory_file.get("lastUpdated", ""),
+            "upsertedFacts": [copy.deepcopy(value) for action, value, _ in notifications if action == "upsert" and isinstance(value, dict)],
+            "deletedFactIds": [str(value) for action, value, _ in notifications if action == "remove"],
+        }
 
     def upsert_fact(
         self,
@@ -998,8 +1044,12 @@ class FileMemoryStorage(MemoryStorage):
     ) -> dict[str, Any]:
         if agent_name is None:
             raise ValueError("agent_name is required to upsert a fact")
+        incoming = copy.deepcopy(fact)
+        incoming["id"] = str(incoming.get("id") or f"fact_{uuid.uuid4().hex}")
+        fact_id = incoming["id"]
+        fact_revision = incoming.get("revision") if expected_revision not in (None, 0) else None
         return self.apply_changes(
-            {"upserts": [fact]},
+            {"upserts": [incoming], "upsertRevisions": {fact_id: fact_revision}},
             user_id=user_id,
             agent_name=agent_name,
             expected_manifest_revision=expected_revision,

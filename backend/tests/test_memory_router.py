@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.gateway.routers import memory
+from deerflow.agents.memory.backends.deermem.deer_mem import DeerMem
 
 
 def _sample_memory(facts: list[dict] | None = None) -> dict:
@@ -182,6 +183,34 @@ def test_update_memory_fact_route_returns_updated_memory() -> None:
             response = client.patch("/api/memory/facts/fact_edit", json={"content": "User prefers spaces", "category": "workflow", "confidence": 0.91})
     assert response.status_code == 200
     assert response.json()["facts"] == updated_memory["facts"]
+
+
+def test_settings_fact_crud_without_agent_name_uses_default_agent(tmp_path) -> None:
+    """The current Settings API sends no agent_name; it must remain usable."""
+    app = FastAPI()
+    app.include_router(memory.router)
+    manager = DeerMem(backend_config={"storage_path": str(tmp_path)})
+
+    with (
+        patch("app.gateway.routers.memory.get_memory_manager", return_value=manager),
+        patch("app.gateway.routers.memory.get_effective_user_id", return_value="alice"),
+        TestClient(app) as client,
+    ):
+        created = client.post("/api/memory/facts", json={"content": "Project uses Python", "category": "context", "confidence": 0.8})
+        assert created.status_code == 200
+        fact_id = created.json()["facts"][0]["id"]
+
+        updated = client.patch(f"/api/memory/facts/{fact_id}", json={"content": "Project uses Python 3.12"})
+        assert updated.status_code == 200
+        assert updated.json()["facts"][0]["content"] == "Project uses Python 3.12"
+
+        deleted = client.delete(f"/api/memory/facts/{fact_id}")
+        assert deleted.status_code == 200
+        assert deleted.json()["facts"] == []
+
+    facts_root = tmp_path / "users" / "alice" / "agents" / "lead-agent" / "facts"
+    assert facts_root.exists()
+    assert not list(facts_root.glob("**/*.md"))
 
 
 def test_update_memory_fact_route_preserves_omitted_fields() -> None:

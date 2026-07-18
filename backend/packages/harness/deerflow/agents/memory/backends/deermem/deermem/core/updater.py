@@ -598,6 +598,29 @@ class MemoryUpdater:
 
     def import_memory_data(self, memory_data: dict[str, Any], agent_name: str | None = None, *, user_id: str | None = None) -> dict[str, Any]:
         """Persist imported memory data via the injected storage."""
+        if agent_name is not None and getattr(type(self._storage), "apply_changes", None) is not MemoryStorage.apply_changes:
+            current = self.get_memory_data(agent_name, user_id=user_id)
+            incoming_facts = copy.deepcopy(memory_data.get("facts", []))
+            if not isinstance(incoming_facts, list) or any(not isinstance(fact, dict) for fact in incoming_facts):
+                raise ValueError("memory_data.facts")
+            for fact in incoming_facts:
+                fact["id"] = str(fact.get("id") or f"fact_{uuid.uuid4().hex}")
+                fact["confidence"] = _coerce_source_confidence(fact)
+            current_by_id = {str(fact.get("id")): fact for fact in current.get("facts", []) if isinstance(fact, dict)}
+            incoming_ids = {str(fact.get("id")) for fact in incoming_facts}
+            self._storage.apply_changes(
+                {
+                    "upserts": incoming_facts,
+                    "upsertRevisions": {str(fact.get("id")): (int(current_by_id[str(fact.get("id"))].get("revision") or 1) if str(fact.get("id")) in current_by_id else None) for fact in incoming_facts},
+                    "deletes": [fact_id for fact_id in current_by_id if fact_id not in incoming_ids],
+                    "deleteRevisions": {fact_id: int(fact.get("revision") or 1) for fact_id, fact in current_by_id.items() if fact_id not in incoming_ids},
+                    "summaries": {"user": copy.deepcopy(memory_data.get("user", {})), "history": copy.deepcopy(memory_data.get("history", {}))},
+                },
+                agent_name=agent_name,
+                user_id=user_id,
+                expected_manifest_revision=int(current.get("revision") or 0),
+            )
+            return self._storage.load(agent_name, user_id=user_id)
         if agent_name is None:
             memory_data = copy.deepcopy(memory_data)
             memory_data["facts"] = []
@@ -609,6 +632,21 @@ class MemoryUpdater:
         """Clear all stored memory data and persist an empty structure."""
         current = self.get_memory_data(agent_name, user_id=user_id)
         cleared_memory = create_empty_memory()
+        if agent_name is not None and getattr(type(self._storage), "apply_changes", None) is not MemoryStorage.apply_changes:
+            facts = [fact for fact in current.get("facts", []) if isinstance(fact, dict)]
+            result = self._storage.apply_changes(
+                {
+                    "deletes": [str(fact.get("id")) for fact in facts],
+                    "deleteRevisions": {str(fact.get("id")): int(fact.get("revision") or 1) for fact in facts},
+                    "summaries": {"user": cleared_memory["user"], "history": cleared_memory["history"]},
+                },
+                agent_name=agent_name,
+                user_id=user_id,
+                expected_manifest_revision=int(current.get("revision") or 0),
+            )
+            for field in ("version", "revision", "lastUpdated"):
+                cleared_memory[field] = result[field]
+            return cleared_memory
         if not self._save_memory_to_file(cleared_memory, agent_name, user_id=user_id, expected_revision=int(current.get("revision") or 0)):
             raise OSError("Failed to save cleared memory data")
         return cleared_memory
@@ -658,6 +696,7 @@ class MemoryUpdater:
             result = self._storage.apply_changes(
                 {
                     "upserts": [fact for fact in updated_memory["facts"] if fact.get("id") == fact_id],
+                    "upsertRevisions": {fact_id: None},
                     "deletes": [str(fact.get("id")) for fact in memory_data.get("facts", []) if str(fact.get("id")) not in kept_ids],
                     "deleteRevisions": {str(fact.get("id")): int(fact.get("revision") or 1) for fact in memory_data.get("facts", []) if str(fact.get("id")) not in kept_ids},
                 },
@@ -665,7 +704,12 @@ class MemoryUpdater:
                 user_id=user_id,
                 expected_manifest_revision=int(memory_data.get("revision") or 0),
             )
-            return result, (fact_id if stored else None)
+            normalized_by_id = {str(fact.get("id")): fact for fact in result["upsertedFacts"]}
+            deleted_ids = set(result["deletedFactIds"])
+            updated_memory["facts"] = [copy.deepcopy(normalized_by_id.get(str(fact.get("id")), fact)) for fact in updated_memory["facts"] if str(fact.get("id")) not in deleted_ids]
+            for field in ("version", "revision", "lastUpdated"):
+                updated_memory[field] = result[field]
+            return updated_memory, (fact_id if stored else None)
         if not self._save_memory_to_file(updated_memory, agent_name, user_id=user_id, expected_revision=int(memory_data.get("revision") or 0)):
             raise OSError("Failed to save memory data after creating fact")
         # If the cap evicted the just-added (lower-confidence) fact, signal via
@@ -682,12 +726,13 @@ class MemoryUpdater:
             if deleted is None:
                 raise KeyError(fact_id)
             global_memory = self.get_memory_data(user_id=user_id)
-            return self._storage.apply_changes(
+            self._storage.apply_changes(
                 {"deletes": [fact_id], "deleteRevisions": {fact_id: int(deleted.get("revision") or 1)}},
                 agent_name=agent_name,
                 user_id=user_id,
                 expected_manifest_revision=int(global_memory.get("revision") or 0),
             )
+            return self.get_memory_data(agent_name, user_id=user_id)
         memory_data = self.get_memory_data(agent_name, user_id=user_id)
         facts = memory_data.get("facts", [])
         updated_facts = [fact for fact in facts if fact.get("id") != fact_id]
@@ -695,12 +740,13 @@ class MemoryUpdater:
             raise KeyError(fact_id)
         deleted = next(fact for fact in facts if fact.get("id") == fact_id)
         if getattr(type(self._storage), "apply_changes", None) is not MemoryStorage.apply_changes:
-            return self._storage.apply_changes(
+            self._storage.apply_changes(
                 {"deletes": [fact_id], "deleteRevisions": {fact_id: int(deleted.get("revision") or 1)}},
                 agent_name=agent_name,
                 user_id=user_id,
                 expected_manifest_revision=int(memory_data.get("revision") or 0),
             )
+            return self.get_memory_data(agent_name, user_id=user_id)
         updated_memory = dict(memory_data)
         updated_memory["facts"] = updated_facts
         if not self._save_memory_to_file(updated_memory, agent_name, user_id=user_id, expected_revision=int(memory_data.get("revision") or 0)):
@@ -725,12 +771,13 @@ class MemoryUpdater:
             if confidence is not None:
                 updated_fact["confidence"] = _validate_confidence(confidence)
             global_memory = self.get_memory_data(user_id=user_id)
-            return self._storage.apply_changes(
-                {"upserts": [updated_fact]},
+            self._storage.apply_changes(
+                {"upserts": [updated_fact], "upsertRevisions": {fact_id: int(updated_fact.get("revision") or 1)}},
                 agent_name=agent_name,
                 user_id=user_id,
                 expected_manifest_revision=int(global_memory.get("revision") or 0),
             )
+            return self.get_memory_data(agent_name, user_id=user_id)
         memory_data = self.get_memory_data(agent_name, user_id=user_id)
         updated_memory = dict(memory_data)
         updated_facts: list[dict[str, Any]] = []
@@ -755,12 +802,13 @@ class MemoryUpdater:
             raise KeyError(fact_id)
         if getattr(type(self._storage), "apply_changes", None) is not MemoryStorage.apply_changes:
             changed = next(fact for fact in updated_facts if fact.get("id") == fact_id)
-            return self._storage.apply_changes(
-                {"upserts": [changed]},
+            self._storage.apply_changes(
+                {"upserts": [changed], "upsertRevisions": {fact_id: int(changed.get("revision") or 1)}},
                 agent_name=agent_name,
                 user_id=user_id,
                 expected_manifest_revision=int(memory_data.get("revision") or 0),
             )
+            return self.get_memory_data(agent_name, user_id=user_id)
         updated_memory["facts"] = updated_facts
         if not self._save_memory_to_file(updated_memory, agent_name, user_id=user_id, expected_revision=int(memory_data.get("revision") or 0)):
             raise OSError(f"Failed to save memory data after updating fact '{fact_id}'")
@@ -859,11 +907,13 @@ class MemoryUpdater:
             current_by_id = {str(fact.get("id")): fact for fact in current_memory.get("facts", [])}
             updated_by_id = {str(fact.get("id")): fact for fact in updated_memory.get("facts", [])}
             change_set = {
-                "upserts": [copy.deepcopy(fact) for fact_id, fact in updated_by_id.items() if current_by_id.get(fact_id) != fact] if agent_name is not None else [],
-                "deletes": [fact_id for fact_id in current_by_id if fact_id not in updated_by_id] if agent_name is not None else [],
-                "deleteRevisions": {fact_id: int(current_by_id[fact_id].get("revision") or 1) for fact_id in current_by_id if fact_id not in updated_by_id} if agent_name is not None else {},
+                "upserts": [copy.deepcopy(fact) for fact_id, fact in updated_by_id.items() if current_by_id.get(fact_id) != fact],
+                "upsertRevisions": {fact_id: (int(current_by_id[fact_id].get("revision") or 1) if fact_id in current_by_id else None) for fact_id, fact in updated_by_id.items() if current_by_id.get(fact_id) != fact},
+                "deletes": [fact_id for fact_id in current_by_id if fact_id not in updated_by_id],
+                "deleteRevisions": {fact_id: int(current_by_id[fact_id].get("revision") or 1) for fact_id in current_by_id if fact_id not in updated_by_id},
             }
-            if agent_name is None:
+            summaries_changed = updated_memory.get("user", {}) != current_memory.get("user", {}) or updated_memory.get("history", {}) != current_memory.get("history", {})
+            if summaries_changed:
                 change_set["summaries"] = {
                     "user": copy.deepcopy(updated_memory.get("user", {})),
                     "history": copy.deepcopy(updated_memory.get("history", {})),

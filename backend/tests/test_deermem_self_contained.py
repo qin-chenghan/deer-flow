@@ -92,6 +92,21 @@ def test_trace_id_threads_through_to_tracing_callback(deermem_data_dir):
     assert calls and calls[0] == ("t1", "trace-42", "gpt-x")
 
 
+def test_default_passive_update_persists_fact_in_lead_agent_bucket(deermem_data_dir):
+    dm = _deermem_with_fake_llm(payload='{"user":{},"history":{},"newFacts":[{"content":"Default agent fact","category":"context","confidence":0.9}],"factsToRemove":[]}')
+
+    dm.add(
+        thread_id="default-thread",
+        messages=[HumanMessage(content="remember this"), AIMessage(content="understood")],
+        user_id="alice",
+    )
+    dm._queue.flush()
+
+    assert [fact["content"] for fact in dm.get_memory(user_id="alice")["facts"]] == ["Default agent fact"]
+    facts_root = deermem_data_dir / "users" / "alice" / "agents" / "lead-agent" / "facts"
+    assert list(facts_root.glob("**/*.md"))
+
+
 def test_tracing_callback_optional_no_langfuse(deermem_data_dir):
     dm = _deermem_with_fake_llm({"model": {"provider": "openai", "model": "gpt-x", "api_key": "k", "base_url": "u"}})
     assert dm._config.tracing_callback is None  # langfuse not hard-required
