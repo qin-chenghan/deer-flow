@@ -2,8 +2,6 @@
 
 > 对比基线：DeerFlow 官方 `upstream/main@bc6f1adc`<br>
 > 当前分支：`factmd-memory`<br>
-> 阅读对象：第一次接触 DeerFlow、Python 后端或文件存储的同学<br>
-> 本文只描述代码当前真正实现的行为，不把未来的检索或 project scope 计划写成已完成。
 
 ---
 
