@@ -785,6 +785,17 @@ File-backed memory now separates global user context from agent facts. Each user
 
 Single-fact repository operations are genuinely incremental: an upsert/delete reads, journals, writes, and re-indexes only the addressed fact files, and returns an explicit incomplete delta rather than a cache-dependent fake full document. Manager/API compatibility methods materialize a fresh full document only when their public response contract requires one, including after a disjoint concurrent create is successfully rebased. Fact-level create/update/delete use separate expected user-memory and fact revisions, allowing bounded rebasing when another agent changed a disjoint fact while stale same-fact writes and same-ID concurrent creates fail. Storage-specific conflicts and corruption are translated at the MemoryManager boundary; the Gateway returns conflict as HTTP 409 and a stable, non-sensitive corruption error as HTTP 500. Full-document `save()` remains a compatibility API and computes a diff before writing; malformed or missing `facts` can no longer silently erase an agent's Markdown files. Legacy migration preserves non-empty `user`/`history` before deleting an agent `memory.json`; conflicting summaries keep the legacy file and fail loudly instead of choosing a winner.
 
+Legacy facts in `memory.json` migrate automatically into the reserved `__default__` Markdown bucket on the user's first normal memory read. Operators who prefer to audit or complete the migration before serving traffic can run the optional idempotent CLI from `backend/`:
+
+```bash
+PYTHONPATH=. python scripts/migrate_memory_markdown.py --all-users --dry-run
+PYTHONPATH=. python scripts/migrate_memory_markdown.py --all-users
+# A custom DeerMem root or original non-directory-safe identity can be explicit:
+PYTHONPATH=. python scripts/migrate_memory_markdown.py --storage-path /path/to/deerflow-home --user-id 'test@example.com'
+```
+
+`--user-id` may be repeated. `--all-users` discovers the existing directory-safe buckets below the selected storage root; standalone integrations that passed raw IDs containing characters such as `@` should use the original value with `--user-id`. A failed user's migration is reported without hiding the rest of the audit, and the command exits non-zero when any user fails. The automatic first-read path remains enabled, so running this CLI is not required for startup.
+
 ## Recommended Models
 
 DeerFlow is model-agnostic — it works with any LLM that implements the OpenAI-compatible API. That said, it performs best with models that support:
