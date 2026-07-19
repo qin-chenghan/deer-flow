@@ -56,10 +56,6 @@ class DeerMemConfig(BaseModel):
         default=False,
         description="Require user_id for every storage scope. False preserves no-auth and legacy callers.",
     )
-    fact_format: Literal["markdown"] = Field(
-        default="markdown",
-        description="Canonical per-fact persistence format. This release supports Markdown with YAML front matter.",
-    )
     manifest_filename: str = Field(
         default="memory.json",
         description="User-global summary JSON filename. Kept under this name for config compatibility; must be a plain .json filename.",
@@ -69,10 +65,6 @@ class DeerMemConfig(BaseModel):
         ge=1,
         le=120,
         description="Maximum wait for the per-scope cross-process advisory file lock.",
-    )
-    journal_enabled: Literal[True] = Field(
-        default=True,
-        description="Multi-file safety journal; fixed on for global summaries plus agent Markdown facts.",
     )
     retrieval_adapter: str = Field(
         default="",
@@ -271,6 +263,7 @@ class DeerMemConfig(BaseModel):
         """
         if not backend_config:
             return cls()
+        backend_config = dict(backend_config)
         known = {k: v for k, v in backend_config.items() if k in cls.model_fields and v is not None}
         unknown = sorted(k for k in backend_config if k not in cls.model_fields)
         if unknown:

@@ -46,7 +46,8 @@ logger = logging.getLogger(__name__)
 
 
 def _resolve_agent_name(agent_name: str | None) -> str:
-    return agent_name or DEFAULT_AGENT_BUCKET
+    """Return DeerFlow's case-insensitive canonical agent identifier."""
+    return agent_name.lower() if agent_name is not None else DEFAULT_AGENT_BUCKET
 
 
 def _call_backend(operation):
@@ -279,7 +280,7 @@ class DeerMem(MemoryManager):
         if agent_name is None:
             memory_data = _call_backend(lambda: self._updater.clear_all_memory_data(user_id=user_id))
         else:
-            memory_data = _call_backend(lambda: self._updater.clear_memory_data(agent_name=agent_name, user_id=user_id))
+            memory_data = _call_backend(lambda: self._updater.clear_memory_data(agent_name=_resolve_agent_name(agent_name), user_id=user_id))
         return _compat_document(memory_data)
 
     def import_memory(

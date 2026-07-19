@@ -9,11 +9,20 @@ import pytest
 import yaml
 from fastapi.testclient import TestClient
 
+from app.gateway.routers.agents import AGENT_NAME_PATTERN as GATEWAY_AGENT_NAME_PATTERN
+from deerflow.agents.memory.backends.deermem.deermem.core.paths import AGENT_NAME_PATTERN as DEERMEM_AGENT_NAME_PATTERN
+from deerflow.agents.memory.backends.deermem.deermem.core.paths import DEFAULT_AGENT_BUCKET, validate_agent_name
 from deerflow.config.agents_api_config import AgentsApiConfig, get_agents_api_config, set_agents_api_config
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def test_reserved_memory_bucket_stays_outside_both_public_agent_patterns() -> None:
+    assert GATEWAY_AGENT_NAME_PATTERN.fullmatch(DEFAULT_AGENT_BUCKET) is None
+    assert DEERMEM_AGENT_NAME_PATTERN.fullmatch(DEFAULT_AGENT_BUCKET) is None
+    validate_agent_name(DEFAULT_AGENT_BUCKET)  # Internal storage sentinel remains usable.
 
 
 def _make_paths(base_dir: Path):

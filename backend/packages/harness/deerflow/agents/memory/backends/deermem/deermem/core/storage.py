@@ -408,15 +408,14 @@ class FileMemoryStorage(MemoryStorage):
         return memory_file_path(self._config, agent_name, user_id=user_id)
 
     def _scope_signature(self, path: Path, agent_name: str | None) -> tuple[Any, ...]:
-        """Track the global summary file plus the selected agent's fact files."""
-        signature: list[Any] = [_file_signature(path)]
-        if agent_name is not None:
-            fact_root = agent_facts_directory(path, agent_name)
-            for fact_path in sorted(fact_root.glob("**/*.md")):
-                file_signature = _file_signature(fact_path)
-                if file_signature is not None:
-                    signature.append((fact_path.as_posix(), *file_signature))
-        return tuple(signature)
+        """Track supported writes in O(1) through the shared transaction file.
+
+        Every storage-managed fact mutation advances and atomically replaces
+        the user-level JSON, so its signature invalidates every agent cache for
+        that user without scanning all Markdown files on every read. Direct
+        out-of-band Markdown edits require ``reload()``.
+        """
+        return (_file_signature(path),)
 
     @staticmethod
     def _validate_loaded_fact(
@@ -1131,6 +1130,7 @@ class FileMemoryStorage(MemoryStorage):
         user_id: str | None = None,
         agent_name: str | None = None,
         expected_manifest_revision: int | None = None,
+        allow_manifest_rebase: bool = False,
     ) -> dict[str, Any]:
         """Commit an incremental change set and return only the applied delta.
 
@@ -1192,7 +1192,7 @@ class FileMemoryStorage(MemoryStorage):
                     )
                 break
             except MemoryManifestRevisionConflict as exc:
-                can_rebase = has_fact_changes and summaries is None and safe_delete_rebase and safe_upsert_rebase and attempt < 2
+                can_rebase = allow_manifest_rebase and has_fact_changes and summaries is None and safe_delete_rebase and safe_upsert_rebase and attempt < 2
                 if not can_rebase:
                     raise
                 current = self._load_memory_file(path)
@@ -1238,6 +1238,7 @@ class FileMemoryStorage(MemoryStorage):
             user_id=user_id,
             agent_name=agent_name,
             expected_manifest_revision=expected_manifest_revision,
+            allow_manifest_rebase=True,
         )
 
     def delete_fact(
@@ -1259,6 +1260,7 @@ class FileMemoryStorage(MemoryStorage):
             user_id=user_id,
             agent_name=agent_name,
             expected_manifest_revision=expected_manifest_revision,
+            allow_manifest_rebase=True,
         )
 
     def get_summaries(

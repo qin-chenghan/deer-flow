@@ -21,6 +21,7 @@ from .prompt import (
     format_conversation_for_update,
 )
 from .storage import (
+    MemoryManifestRevisionConflict,
     MemoryStorage,
     create_empty_memory,
     utc_now_iso_z,
@@ -630,23 +631,29 @@ class MemoryUpdater:
 
     def clear_memory_data(self, agent_name: str | None = None, *, user_id: str | None = None) -> dict[str, Any]:
         """Clear one selected agent's facts without resetting shared summaries."""
+        if agent_name is not None and getattr(type(self._storage), "apply_changes", None) is not MemoryStorage.apply_changes:
+            for attempt in range(3):
+                current = self.get_memory_data(agent_name, user_id=user_id) if attempt == 0 else self.reload_memory_data(agent_name, user_id=user_id)
+                facts = [fact for fact in current.get("facts", []) if isinstance(fact, dict)]
+                try:
+                    self._storage.apply_changes(
+                        {
+                            "deletes": [str(fact.get("id")) for fact in facts],
+                            "deleteRevisions": {str(fact.get("id")): int(fact.get("revision") or 1) for fact in facts},
+                        },
+                        agent_name=agent_name,
+                        user_id=user_id,
+                        expected_manifest_revision=int(current.get("revision") or 0),
+                    )
+                    return self.reload_memory_data(agent_name, user_id=user_id)
+                except MemoryManifestRevisionConflict:
+                    if attempt == 2:
+                        raise
+                    logger.info("Retrying scoped memory clear from a fresh snapshot after a revision conflict")
+            raise AssertionError("bounded scoped-clear retry did not return or raise")
         current = self.get_memory_data(agent_name, user_id=user_id)
         cleared_memory = copy.deepcopy(current)
         cleared_memory["facts"] = []
-        if agent_name is not None and getattr(type(self._storage), "apply_changes", None) is not MemoryStorage.apply_changes:
-            facts = [fact for fact in current.get("facts", []) if isinstance(fact, dict)]
-            result = self._storage.apply_changes(
-                {
-                    "deletes": [str(fact.get("id")) for fact in facts],
-                    "deleteRevisions": {str(fact.get("id")): int(fact.get("revision") or 1) for fact in facts},
-                },
-                agent_name=agent_name,
-                user_id=user_id,
-                expected_manifest_revision=int(current.get("revision") or 0),
-            )
-            for field in ("version", "revision", "lastUpdated"):
-                cleared_memory[field] = result[field]
-            return cleared_memory
         if not self._save_memory_to_file(cleared_memory, agent_name, user_id=user_id, expected_revision=int(current.get("revision") or 0)):
             raise OSError("Failed to save cleared memory data")
         return cleared_memory
@@ -689,42 +696,45 @@ class MemoryUpdater:
         normalized_category = category.strip() or "context"
         validated_confidence = _validate_confidence(confidence)
         now = utc_now_iso_z()
+        fact_id = f"fact_{uuid.uuid4().hex[:8]}"
+        candidate = {
+            "id": fact_id,
+            "content": normalized_content,
+            "category": normalized_category,
+            "confidence": validated_confidence,
+            "createdAt": now,
+            "source": "manual",
+        }
+        if getattr(type(self._storage), "apply_changes", None) is not MemoryStorage.apply_changes:
+            for attempt in range(3):
+                memory_data = self.get_memory_data(agent_name, user_id=user_id) if attempt == 0 else self.reload_memory_data(agent_name, user_id=user_id)
+                updated_memory = dict(memory_data)
+                updated_memory["facts"] = _trim_facts_to_max([*memory_data.get("facts", []), copy.deepcopy(candidate)], self._config.max_facts)
+                kept_ids = {str(fact.get("id")) for fact in updated_memory["facts"]}
+                deletions = [str(fact.get("id")) for fact in memory_data.get("facts", []) if str(fact.get("id")) not in kept_ids]
+                try:
+                    self._storage.apply_changes(
+                        {
+                            "upserts": [fact for fact in updated_memory["facts"] if fact.get("id") == fact_id],
+                            "upsertRevisions": {fact_id: None},
+                            "deletes": deletions,
+                            "deleteRevisions": {str(fact.get("id")): int(fact.get("revision") or 1) for fact in memory_data.get("facts", []) if str(fact.get("id")) in deletions},
+                        },
+                        agent_name=agent_name,
+                        user_id=user_id,
+                        expected_manifest_revision=int(memory_data.get("revision") or 0),
+                    )
+                    fresh_memory = self.reload_memory_data(agent_name, user_id=user_id)
+                    stored = any(fact.get("id") == fact_id for fact in fresh_memory.get("facts", []))
+                    return fresh_memory, (fact_id if stored else None)
+                except MemoryManifestRevisionConflict:
+                    if attempt == 2:
+                        raise
+                    logger.info("Retrying capped fact creation from a fresh snapshot after a revision conflict")
+            raise AssertionError("bounded create retry did not return or raise")
         memory_data = self.get_memory_data(agent_name, user_id=user_id)
         updated_memory = dict(memory_data)
-        facts = list(memory_data.get("facts", []))
-        fact_id = f"fact_{uuid.uuid4().hex[:8]}"
-        facts.append(
-            {
-                "id": fact_id,
-                "content": normalized_content,
-                "category": normalized_category,
-                "confidence": validated_confidence,
-                "createdAt": now,
-                "source": "manual",
-            }
-        )
-        updated_memory["facts"] = _trim_facts_to_max(facts, self._config.max_facts)
-        if getattr(type(self._storage), "apply_changes", None) is not MemoryStorage.apply_changes:
-            kept_ids = {str(fact.get("id")) for fact in updated_memory["facts"]}
-            self._storage.apply_changes(
-                {
-                    "upserts": [fact for fact in updated_memory["facts"] if fact.get("id") == fact_id],
-                    "upsertRevisions": {fact_id: None},
-                    "deletes": [str(fact.get("id")) for fact in memory_data.get("facts", []) if str(fact.get("id")) not in kept_ids],
-                    "deleteRevisions": {str(fact.get("id")): int(fact.get("revision") or 1) for fact in memory_data.get("facts", []) if str(fact.get("id")) not in kept_ids},
-                },
-                agent_name=agent_name,
-                user_id=user_id,
-                expected_manifest_revision=int(memory_data.get("revision") or 0),
-            )
-            # ``apply_changes`` returns an incremental delta. A disjoint writer
-            # may have committed between our snapshot and the successful
-            # rebase, so reconstructing a document from that old snapshot can
-            # omit its sibling fact. Reload only at this compatibility boundary;
-            # the mutation itself remains a per-fact write.
-            fresh_memory = self.get_memory_data(agent_name, user_id=user_id)
-            stored = any(fact.get("id") == fact_id for fact in fresh_memory.get("facts", []))
-            return fresh_memory, (fact_id if stored else None)
+        updated_memory["facts"] = _trim_facts_to_max([*memory_data.get("facts", []), candidate], self._config.max_facts)
         if not self._save_memory_to_file(updated_memory, agent_name, user_id=user_id, expected_revision=int(memory_data.get("revision") or 0)):
             raise OSError("Failed to save memory data after creating fact")
         # If the cap evicted the just-added (lower-confidence) fact, signal via
@@ -746,6 +756,7 @@ class MemoryUpdater:
                 agent_name=agent_name,
                 user_id=user_id,
                 expected_manifest_revision=int(global_memory.get("revision") or 0),
+                allow_manifest_rebase=True,
             )
             return self.get_memory_data(agent_name, user_id=user_id)
         memory_data = self.get_memory_data(agent_name, user_id=user_id)
@@ -760,6 +771,7 @@ class MemoryUpdater:
                 agent_name=agent_name,
                 user_id=user_id,
                 expected_manifest_revision=int(memory_data.get("revision") or 0),
+                allow_manifest_rebase=True,
             )
             return self.get_memory_data(agent_name, user_id=user_id)
         updated_memory = dict(memory_data)
@@ -791,6 +803,7 @@ class MemoryUpdater:
                 agent_name=agent_name,
                 user_id=user_id,
                 expected_manifest_revision=int(global_memory.get("revision") or 0),
+                allow_manifest_rebase=True,
             )
             return self.get_memory_data(agent_name, user_id=user_id)
         memory_data = self.get_memory_data(agent_name, user_id=user_id)
@@ -822,6 +835,7 @@ class MemoryUpdater:
                 agent_name=agent_name,
                 user_id=user_id,
                 expected_manifest_revision=int(memory_data.get("revision") or 0),
+                allow_manifest_rebase=True,
             )
             return self.get_memory_data(agent_name, user_id=user_id)
         updated_memory["facts"] = updated_facts
@@ -914,32 +928,47 @@ class MemoryUpdater:
     ) -> bool:
         """Parse the model response, apply updates, and persist memory."""
         update_data = _parse_memory_update_response(response_content)
+        if getattr(type(self._storage), "apply_changes", None) is not MemoryStorage.apply_changes:
+            for attempt in range(3):
+                # Deep-copy before in-place mutation so a failed commit cannot
+                # corrupt the cached snapshot. On a manifest conflict the
+                # complete extraction result is reapplied to a fresh document;
+                # its trim/consolidation/delete decisions are snapshot-wide and
+                # must never be replayed as disjoint point writes.
+                updated_memory = self._apply_updates(copy.deepcopy(current_memory), update_data, thread_id)
+                updated_memory = _strip_upload_mentions_from_memory(updated_memory)
+                current_by_id = {str(fact.get("id")): fact for fact in current_memory.get("facts", [])}
+                updated_by_id = {str(fact.get("id")): fact for fact in updated_memory.get("facts", [])}
+                change_set = {
+                    "upserts": [copy.deepcopy(fact) for fact_id, fact in updated_by_id.items() if current_by_id.get(fact_id) != fact],
+                    "upsertRevisions": {fact_id: (int(current_by_id[fact_id].get("revision") or 1) if fact_id in current_by_id else None) for fact_id, fact in updated_by_id.items() if current_by_id.get(fact_id) != fact},
+                    "deletes": [fact_id for fact_id in current_by_id if fact_id not in updated_by_id],
+                    "deleteRevisions": {fact_id: int(current_by_id[fact_id].get("revision") or 1) for fact_id in current_by_id if fact_id not in updated_by_id},
+                }
+                summaries_changed = updated_memory.get("user", {}) != current_memory.get("user", {}) or updated_memory.get("history", {}) != current_memory.get("history", {})
+                if summaries_changed:
+                    change_set["summaries"] = {
+                        "user": copy.deepcopy(updated_memory.get("user", {})),
+                        "history": copy.deepcopy(updated_memory.get("history", {})),
+                    }
+                try:
+                    self._storage.apply_changes(
+                        change_set,
+                        agent_name=agent_name,
+                        user_id=user_id,
+                        expected_manifest_revision=int(current_memory.get("revision") or 0),
+                    )
+                    return True
+                except MemoryManifestRevisionConflict:
+                    if attempt == 2:
+                        raise
+                    current_memory = self.reload_memory_data(agent_name, user_id=user_id)
+                    logger.info("Retrying extracted memory update from a fresh snapshot after a revision conflict")
+            raise AssertionError("bounded extracted-update retry did not return or raise")
         # Deep-copy before in-place mutation so a subsequent save() failure
         # cannot corrupt the still-cached original object reference.
         updated_memory = self._apply_updates(copy.deepcopy(current_memory), update_data, thread_id)
         updated_memory = _strip_upload_mentions_from_memory(updated_memory)
-        if getattr(type(self._storage), "apply_changes", None) is not MemoryStorage.apply_changes:
-            current_by_id = {str(fact.get("id")): fact for fact in current_memory.get("facts", [])}
-            updated_by_id = {str(fact.get("id")): fact for fact in updated_memory.get("facts", [])}
-            change_set = {
-                "upserts": [copy.deepcopy(fact) for fact_id, fact in updated_by_id.items() if current_by_id.get(fact_id) != fact],
-                "upsertRevisions": {fact_id: (int(current_by_id[fact_id].get("revision") or 1) if fact_id in current_by_id else None) for fact_id, fact in updated_by_id.items() if current_by_id.get(fact_id) != fact},
-                "deletes": [fact_id for fact_id in current_by_id if fact_id not in updated_by_id],
-                "deleteRevisions": {fact_id: int(current_by_id[fact_id].get("revision") or 1) for fact_id in current_by_id if fact_id not in updated_by_id},
-            }
-            summaries_changed = updated_memory.get("user", {}) != current_memory.get("user", {}) or updated_memory.get("history", {}) != current_memory.get("history", {})
-            if summaries_changed:
-                change_set["summaries"] = {
-                    "user": copy.deepcopy(updated_memory.get("user", {})),
-                    "history": copy.deepcopy(updated_memory.get("history", {})),
-                }
-            self._storage.apply_changes(
-                change_set,
-                agent_name=agent_name,
-                user_id=user_id,
-                expected_manifest_revision=int(current_memory.get("revision") or 0),
-            )
-            return True
         return self._storage.save(
             updated_memory,
             agent_name,

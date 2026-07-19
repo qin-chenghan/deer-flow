@@ -129,6 +129,38 @@ def test_cached_document_is_not_mutable_by_caller(storage: FileMemoryStorage) ->
     assert second["facts"][0]["content"] == "Project uses Python 3.12"
 
 
+def test_cached_load_does_not_scan_all_fact_files(storage: FileMemoryStorage, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert storage.save(_memory_with_fact(), "agent-a", user_id="alice")
+    storage.load("agent-a", user_id="alice")
+
+    def fail_fact_scan(*args, **kwargs):
+        raise AssertionError("cached load scanned the agent fact directory")
+
+    monkeypatch.setattr(storage_module, "agent_facts_directory", fail_fact_scan)
+
+    assert storage.load("agent-a", user_id="alice")["facts"][0]["content"] == "Project uses Python 3.12"
+
+
+def test_shared_json_signature_invalidates_cache_after_other_storage_writes(tmp_path: Path) -> None:
+    config = DeerMemConfig(storage_path=str(tmp_path))
+    first = FileMemoryStorage(config)
+    second = FileMemoryStorage(config)
+    assert first.save(_memory_with_fact(), "agent-a", user_id="alice")
+    cached = first.load("agent-a", user_id="alice")
+    changed = copy.deepcopy(cached["facts"][0])
+    changed["content"] = "changed by another storage instance"
+
+    second.apply_changes(
+        {"upserts": [changed], "upsertRevisions": {changed["id"]: changed["revision"]}},
+        user_id="alice",
+        agent_name="agent-a",
+        expected_manifest_revision=cached["revision"],
+        allow_manifest_rebase=True,
+    )
+
+    assert first.load("agent-a", user_id="alice")["facts"][0]["content"] == "changed by another storage instance"
+
+
 def test_corrupt_manifest_raises_and_is_not_treated_as_empty(storage: FileMemoryStorage) -> None:
     path = storage._get_memory_file_path(user_id="alice")
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -442,6 +474,18 @@ def test_default_bucket_is_isolated_from_custom_lead_agent(tmp_path: Path, custo
     assert list((tmp_path / "users" / "alice" / "agents" / "lead-agent" / "facts").glob("**/*.md"))
 
 
+def test_deermem_canonicalizes_agent_names_to_lowercase(tmp_path: Path) -> None:
+    manager = DeerMem(backend_config={"storage_path": str(tmp_path)})
+
+    manager.create_fact("case-insensitive fact", agent_name="Lead-Agent", user_id="alice")
+
+    lower = manager.get_memory(agent_name="lead-agent", user_id="alice")
+    upper = manager.get_memory(agent_name="LEAD-AGENT", user_id="alice")
+    stored = manager._storage.load("lead-agent", user_id="alice")["facts"][0]
+    assert [fact["id"] for fact in lower["facts"]] == [fact["id"] for fact in upper["facts"]]
+    assert stored["scope"]["agentName"] == "lead-agent"
+
+
 def test_old_implicit_lead_agent_bucket_moves_to_reserved_default(tmp_path: Path) -> None:
     config = DeerMemConfig(storage_path=str(tmp_path))
     old_storage = FileMemoryStorage(config)
@@ -501,6 +545,80 @@ def test_create_returns_fresh_full_view_after_disjoint_rebase(tmp_path: Path, mo
     assert created_id is not None
     assert {fact["id"] for fact in returned["facts"]} == {fact["id"] for fact in fresh["facts"]}
     assert {fact["content"] for fact in returned["facts"]} == {"competing fact", "requested fact"}
+
+
+def test_scoped_clear_recomputes_after_competing_create(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = DeerMem(backend_config={"storage_path": str(tmp_path)})
+    manager.create_fact("existing fact", agent_name="agent-a", user_id="alice")
+    competing_storage = FileMemoryStorage(manager._config)
+    real_apply_changes = manager._storage.apply_changes
+    injected = False
+
+    def apply_with_competing_create(change_set, **scope):
+        nonlocal injected
+        if not injected:
+            injected = True
+            competing_fact = _memory_with_fact("competing fact")["facts"][0]
+            competing_fact.update({"id": "fact_competing", "revision": 1})
+            competing_storage.apply_changes(
+                {"upserts": [competing_fact], "upsertRevisions": {"fact_competing": None}},
+                agent_name=scope["agent_name"],
+                user_id=scope["user_id"],
+                expected_manifest_revision=scope["expected_manifest_revision"],
+            )
+        return real_apply_changes(change_set, **scope)
+
+    monkeypatch.setattr(manager._storage, "apply_changes", apply_with_competing_create)
+
+    returned = manager.clear_memory(agent_name="agent-a", user_id="alice")
+    fresh = manager.reload_memory(agent_name="agent-a", user_id="alice")
+
+    assert returned["facts"] == []
+    assert fresh["facts"] == []
+
+
+def test_max_facts_is_recomputed_after_competing_create(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = DeerMem(backend_config={"storage_path": str(tmp_path), "max_facts": 10})
+    initial = create_empty_memory()
+    initial["facts"] = []
+    for index in range(9):
+        fact = copy.deepcopy(_memory_with_fact(f"existing {index}")["facts"][0])
+        fact.update({"id": f"fact_existing_{index}", "confidence": 0.9})
+        initial["facts"].append(fact)
+    assert manager._storage.save(initial, "agent-a", user_id="alice")
+
+    competing_storage = FileMemoryStorage(manager._config)
+    real_apply_changes = manager._storage.apply_changes
+    injected = False
+
+    def apply_with_competing_create(change_set, **scope):
+        nonlocal injected
+        if not injected:
+            injected = True
+            competing_fact = copy.deepcopy(_memory_with_fact("competing fact")["facts"][0])
+            competing_fact.update({"id": "fact_competing", "confidence": 0.9})
+            competing_storage.apply_changes(
+                {"upserts": [competing_fact], "upsertRevisions": {"fact_competing": None}},
+                agent_name=scope["agent_name"],
+                user_id=scope["user_id"],
+                expected_manifest_revision=scope["expected_manifest_revision"],
+            )
+        return real_apply_changes(change_set, **scope)
+
+    monkeypatch.setattr(manager._storage, "apply_changes", apply_with_competing_create)
+
+    returned, created_id = manager.create_fact(
+        "requested fact",
+        confidence=0.95,
+        agent_name="agent-a",
+        user_id="alice",
+    )
+    fresh = manager.reload_memory(agent_name="agent-a", user_id="alice")
+
+    assert created_id is not None
+    assert len(returned["facts"]) <= 10
+    assert len(fresh["facts"]) <= 10
+    assert {fact["id"] for fact in returned["facts"]} == {fact["id"] for fact in fresh["facts"]}
 
 
 def test_agent_fact_scope_must_match_requested_directory(storage: FileMemoryStorage) -> None:
@@ -670,13 +788,25 @@ def test_stale_user_revision_rebases_disjoint_fact_change_but_not_same_fact(stor
     second_update["content"] = "second changed"
 
     storage.apply_changes({"upserts": [first_update]}, user_id="alice", agent_name="agent-a", expected_manifest_revision=1)
-    rebased = storage.apply_changes({"upserts": [second_update]}, user_id="alice", agent_name="agent-a", expected_manifest_revision=1)
+    rebased = storage.apply_changes(
+        {"upserts": [second_update]},
+        user_id="alice",
+        agent_name="agent-a",
+        expected_manifest_revision=1,
+        allow_manifest_rebase=True,
+    )
     assert [fact["content"] for fact in rebased["upsertedFacts"]] == ["second changed"]
     assert {fact["content"] for fact in storage.load("agent-a", user_id="alice")["facts"]} == {"first changed", "second changed"}
 
     first_update["content"] = "stale overwrite"
     with pytest.raises(MemoryRevisionConflict):
-        storage.apply_changes({"upserts": [first_update]}, user_id="alice", agent_name="agent-a", expected_manifest_revision=1)
+        storage.apply_changes(
+            {"upserts": [first_update]},
+            user_id="alice",
+            agent_name="agent-a",
+            expected_manifest_revision=1,
+            allow_manifest_rebase=True,
+        )
 
 
 def test_rebuild_index_continues_after_adapter_exception(tmp_path: Path) -> None:
@@ -825,6 +955,7 @@ def test_two_storage_instances_cannot_create_the_same_fact_id(tmp_path: Path) ->
             user_id="alice",
             agent_name="agent-a",
             expected_manifest_revision=0,
+            allow_manifest_rebase=True,
         )
 
     stored = first_storage.get_fact(new_fact["id"], user_id="alice", agent_name="agent-a")
