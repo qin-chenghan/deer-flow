@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.gateway.routers import memory
+from deerflow.agents.memory import MemoryConflictError, MemoryCorruptionError
 from deerflow.agents.memory.backends.deermem.deer_mem import DeerMem
 
 
@@ -146,6 +147,34 @@ def test_create_memory_fact_route_returns_updated_memory() -> None:
     assert response.json()["facts"] == updated_memory["facts"]
 
 
+def test_create_memory_fact_route_maps_conflict_to_409() -> None:
+    app = FastAPI()
+    app.include_router(memory.router)
+    mock_mgr = MagicMock()
+    mock_mgr.create_fact.side_effect = MemoryConflictError("stale write")
+
+    with patch("app.gateway.routers.memory.get_memory_manager", return_value=mock_mgr):
+        with TestClient(app) as client:
+            response = client.post("/api/memory/facts", json={"content": "fact"})
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Memory changed concurrently; reload and retry."
+
+
+def test_get_memory_route_maps_corruption_to_stable_500() -> None:
+    app = FastAPI()
+    app.include_router(memory.router)
+    mock_mgr = MagicMock()
+    mock_mgr.get_memory.side_effect = MemoryCorruptionError("private path and parser detail")
+
+    with patch("app.gateway.routers.memory.get_memory_manager", return_value=mock_mgr):
+        with TestClient(app) as client:
+            response = client.get("/api/memory")
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == "Stored memory data is corrupted."
+
+
 def test_delete_memory_fact_route_returns_updated_memory() -> None:
     app = FastAPI()
     app.include_router(memory.router)
@@ -222,6 +251,7 @@ def test_settings_fact_crud_without_agent_name_uses_default_agent(tmp_path) -> N
 
         created = client.post("/api/memory/facts", json={"content": "Project uses Python", "category": "context", "confidence": 0.8})
         assert created.status_code == 200
+        assert all(isinstance(fact["source"], str) for fact in created.json()["facts"])
         fact_id = next(fact["id"] for fact in created.json()["facts"] if fact["content"] == "Project uses Python")
 
         updated = client.patch(f"/api/memory/facts/{fact_id}", json={"content": "Project uses Python 3.12"})

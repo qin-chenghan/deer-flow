@@ -629,16 +629,16 @@ class MemoryUpdater:
         return self._storage.load(agent_name, user_id=user_id)
 
     def clear_memory_data(self, agent_name: str | None = None, *, user_id: str | None = None) -> dict[str, Any]:
-        """Clear all stored memory data and persist an empty structure."""
+        """Clear one selected agent's facts without resetting shared summaries."""
         current = self.get_memory_data(agent_name, user_id=user_id)
-        cleared_memory = create_empty_memory()
+        cleared_memory = copy.deepcopy(current)
+        cleared_memory["facts"] = []
         if agent_name is not None and getattr(type(self._storage), "apply_changes", None) is not MemoryStorage.apply_changes:
             facts = [fact for fact in current.get("facts", []) if isinstance(fact, dict)]
             result = self._storage.apply_changes(
                 {
                     "deletes": [str(fact.get("id")) for fact in facts],
                     "deleteRevisions": {str(fact.get("id")): int(fact.get("revision") or 1) for fact in facts},
-                    "summaries": {"user": cleared_memory["user"], "history": cleared_memory["history"]},
                 },
                 agent_name=agent_name,
                 user_id=user_id,
@@ -648,6 +648,20 @@ class MemoryUpdater:
                 cleared_memory[field] = result[field]
             return cleared_memory
         if not self._save_memory_to_file(cleared_memory, agent_name, user_id=user_id, expected_revision=int(current.get("revision") or 0)):
+            raise OSError("Failed to save cleared memory data")
+        return cleared_memory
+
+    def clear_all_memory_data(self, *, user_id: str | None = None) -> dict[str, Any]:
+        """Clear global summaries and every agent fact bucket for one user."""
+        if getattr(type(self._storage), "clear_all", None) is not MemoryStorage.clear_all:
+            return self._storage.clear_all(user_id=user_id)
+        current = self.get_memory_data(user_id=user_id)
+        cleared_memory = create_empty_memory()
+        if not self._save_memory_to_file(
+            cleared_memory,
+            user_id=user_id,
+            expected_revision=int(current.get("revision") or 0),
+        ):
             raise OSError("Failed to save cleared memory data")
         return cleared_memory
 

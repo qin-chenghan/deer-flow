@@ -21,6 +21,7 @@ import shutil
 import threading
 import time
 import uuid
+import weakref
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -30,7 +31,7 @@ from typing import Any, Protocol
 import yaml
 
 from ..config import DeerMemConfig
-from .paths import DEFAULT_AGENT_BUCKET, agent_facts_directory, fact_file_path, memory_file_path
+from .paths import DEFAULT_AGENT_BUCKET, agent_facts_directory, fact_file_path, memory_file_path, safe_user_id, validate_agent_name
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,14 @@ class MemoryStorageCorruption(MemoryStorageError):
 
 class MemoryRevisionConflict(MemoryStorageError):
     """A stale writer attempted to overwrite a newer user-memory revision."""
+
+
+class MemoryManifestRevisionConflict(MemoryRevisionConflict):
+    """The shared user-memory revision changed before a transaction committed."""
+
+
+class MemoryFactRevisionConflict(MemoryRevisionConflict):
+    """A fact no longer satisfies its expected absence or revision."""
 
 
 class RetrievalPort(Protocol):
@@ -201,7 +210,7 @@ def _normalize_fact(
         if not isinstance(existing_revision, int) or existing_revision < 1:
             raise MemoryStorageCorruption(f"Stored fact {normalized['id']!r} has an invalid revision")
         if revision != existing_revision:
-            raise MemoryRevisionConflict(f"Expected fact {normalized['id']!r} revision {revision}, found {existing_revision}")
+            raise MemoryFactRevisionConflict(f"Expected fact {normalized['id']!r} revision {revision}, found {existing_revision}")
         normalized["createdAt"] = existing.get("createdAt") or normalized.get("createdAt") or now
         comparison_keys = {"revision", "updatedAt"}
         incoming_material = {key: value for key, value in normalized.items() if key not in comparison_keys}
@@ -279,6 +288,17 @@ def _parse_fact_markdown(path: Path) -> dict[str, Any]:
         raise MemoryStorageCorruption(f"Failed to parse canonical fact {path}: {exc}") from exc
 
 
+def _fsync_parent_directory(directory: Path) -> None:
+    """Make a completed rename durable on POSIX filesystems."""
+    if os.name == "nt":
+        return
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _atomic_write(path: Path, raw: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
@@ -288,6 +308,7 @@ def _atomic_write(path: Path, raw: bytes) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         temp.replace(path)
+        _fsync_parent_directory(path.parent)
     finally:
         try:
             temp.unlink(missing_ok=True)
@@ -362,6 +383,10 @@ class MemoryStorage(abc.ABC):
         """Apply one repository change set; providers may override atomically."""
         raise NotImplementedError
 
+    def clear_all(self, *, user_id: str | None = None) -> dict[str, Any]:
+        """Clear global summaries and every agent fact bucket for one user."""
+        raise NotImplementedError
+
 
 class FileMemoryStorage(MemoryStorage):
     def __init__(self, config: DeerMemConfig, retrieval: RetrievalPort | None = None):
@@ -369,7 +394,7 @@ class FileMemoryStorage(MemoryStorage):
         self._retrieval = retrieval
         self._memory_cache: dict[tuple[str | None, str | None], tuple[dict[str, Any], tuple[Any, ...]]] = {}
         self._cache_lock = threading.Lock()
-        self._scope_locks: dict[tuple[str | None, str | None], threading.RLock] = {}
+        self._scope_locks: weakref.WeakValueDictionary[tuple[str | None, str | None], threading.RLock] = weakref.WeakValueDictionary()
 
     @staticmethod
     def _cache_key(agent_name: str | None = None, *, user_id: str | None = None) -> tuple[str | None, str | None]:
@@ -624,7 +649,7 @@ class FileMemoryStorage(MemoryStorage):
         current_memory = self._load_memory_file(path)
         current_revision = int((current_memory or {}).get("revision") or 0)
         if expected_revision is not None and expected_revision != current_revision:
-            raise MemoryRevisionConflict(f"Expected user-memory revision {expected_revision}, found {current_revision}")
+            raise MemoryManifestRevisionConflict(f"Expected user-memory revision {expected_revision}, found {current_revision}")
         if (upserts or deletes) and agent_name is None:
             raise ValueError("agent_name is required for fact repository changes")
 
@@ -644,11 +669,11 @@ class FileMemoryStorage(MemoryStorage):
             if upsert_revisions is not None and fact_id in upsert_revisions:
                 expected_fact_revision = upsert_revisions[fact_id]
                 if expected_fact_revision is None and existing is not None:
-                    raise MemoryRevisionConflict(f"Fact {fact_id!r} must not already exist")
+                    raise MemoryFactRevisionConflict(f"Fact {fact_id!r} must not already exist")
                 if expected_fact_revision is not None:
                     actual_fact_revision = None if existing is None else existing.get("revision")
                     if actual_fact_revision != expected_fact_revision:
-                        raise MemoryRevisionConflict(f"Expected fact {fact_id!r} revision {expected_fact_revision}, found {actual_fact_revision}")
+                        raise MemoryFactRevisionConflict(f"Expected fact {fact_id!r} revision {expected_fact_revision}, found {actual_fact_revision}")
             normalized = _normalize_fact(candidate, scope=scope, existing=existing)
             if existing != normalized:
                 prepared[fact_id] = (normalized, existing, fact_path)
@@ -666,7 +691,7 @@ class FileMemoryStorage(MemoryStorage):
             if existing is None:
                 continue
             if delete_revisions and fact_id in delete_revisions and delete_revisions[fact_id] != existing.get("revision"):
-                raise MemoryRevisionConflict(f"Expected fact {fact_id!r} revision {delete_revisions[fact_id]}, found {existing.get('revision')}")
+                raise MemoryFactRevisionConflict(f"Expected fact {fact_id!r} revision {delete_revisions[fact_id]}, found {existing.get('revision')}")
             removals[fact_id] = (existing, fact_path)
 
         base = current_memory or create_empty_memory()
@@ -997,6 +1022,64 @@ class FileMemoryStorage(MemoryStorage):
                     logger.exception("Retrieval notification failed for %s", value)
         return True
 
+    def clear_all(self, *, user_id: str | None = None) -> dict[str, Any]:
+        """Clear one user's summaries and all agent facts, preserving agent configs."""
+        path = self._get_memory_file_path(user_id=user_id)
+        key = self._cache_key(user_id=user_id)
+        notifications_by_agent: list[tuple[str, list[tuple[str, dict[str, Any] | str, str | None]]]] = []
+        with (
+            self._scope_lock(key),
+            _process_file_lock(
+                path.parent / ".memory.lock",
+                float(getattr(self._config, "file_lock_timeout_seconds", 10)),
+            ),
+        ):
+            self._recover_if_needed(path)
+            agents_root = path.parent / "agents"
+            if agents_root.exists():
+                for agent_dir in sorted(child for child in agents_root.iterdir() if child.is_dir()):
+                    agent_name = agent_dir.name
+                    validate_agent_name(agent_name)
+                    facts = self._load_agent_facts(path, agent_name, user_id=user_id)
+                    if not facts:
+                        continue
+                    current_memory = self._load_memory_file(path)
+                    _, notifications = self._commit_changes_locked(
+                        path,
+                        user_id=user_id,
+                        agent_name=agent_name,
+                        upserts=[],
+                        deletes=[str(fact["id"]) for fact in facts],
+                        summaries=None,
+                        expected_revision=int((current_memory or {}).get("revision") or 0),
+                        delete_revisions={str(fact["id"]): int(fact.get("revision") or 1) for fact in facts},
+                    )
+                    notifications_by_agent.append((agent_name, notifications))
+
+            empty = create_empty_memory()
+            current_memory = self._load_memory_file(path)
+            self._commit_changes_locked(
+                path,
+                user_id=user_id,
+                agent_name=None,
+                upserts=[],
+                deletes=[],
+                summaries={"user": empty["user"], "history": empty["history"]},
+                expected_revision=int((current_memory or {}).get("revision") or 0),
+            )
+
+        if self._retrieval is not None:
+            for agent_name, notifications in notifications_by_agent:
+                scope = _scope_dict(user_id, agent_name)
+                for action, value, _ in notifications:
+                    if action != "remove":
+                        continue
+                    try:
+                        self._retrieval.remove(str(value), scope=scope)
+                    except Exception:
+                        logger.exception("Retrieval notification failed for %s", value)
+        return self.reload(DEFAULT_AGENT_BUCKET, user_id=user_id)
+
     @staticmethod
     def _scope_kwargs(scope: dict[str, str | None]) -> dict[str, str]:
         kwargs: dict[str, str] = {}
@@ -1108,9 +1191,8 @@ class FileMemoryStorage(MemoryStorage):
                         upsert_revisions=normalized_upsert_revisions,
                     )
                 break
-            except MemoryRevisionConflict as exc:
-                manifest_conflict = str(exc).startswith("Expected user-memory revision ")
-                can_rebase = manifest_conflict and has_fact_changes and summaries is None and safe_delete_rebase and safe_upsert_rebase and attempt < 2
+            except MemoryManifestRevisionConflict as exc:
+                can_rebase = has_fact_changes and summaries is None and safe_delete_rebase and safe_upsert_rebase and attempt < 2
                 if not can_rebase:
                     raise
                 current = self._load_memory_file(path)
@@ -1143,19 +1225,19 @@ class FileMemoryStorage(MemoryStorage):
         *,
         user_id: str | None = None,
         agent_name: str | None = None,
-        expected_revision: int | None = None,
+        expected_manifest_revision: int | None = None,
+        expected_fact_revision: int | None = None,
     ) -> dict[str, Any]:
         if agent_name is None:
             raise ValueError("agent_name is required to upsert a fact")
         incoming = copy.deepcopy(fact)
         incoming["id"] = str(incoming.get("id") or f"fact_{uuid.uuid4().hex}")
         fact_id = incoming["id"]
-        fact_revision = incoming.get("revision") if expected_revision not in (None, 0) else None
         return self.apply_changes(
-            {"upserts": [incoming], "upsertRevisions": {fact_id: fact_revision}},
+            {"upserts": [incoming], "upsertRevisions": {fact_id: expected_fact_revision}},
             user_id=user_id,
             agent_name=agent_name,
-            expected_manifest_revision=expected_revision,
+            expected_manifest_revision=expected_manifest_revision,
         )
 
     def delete_fact(
@@ -1164,15 +1246,19 @@ class FileMemoryStorage(MemoryStorage):
         *,
         user_id: str | None = None,
         agent_name: str | None = None,
-        expected_revision: int | None = None,
+        expected_manifest_revision: int | None = None,
+        expected_fact_revision: int | None = None,
     ) -> dict[str, Any]:
         if agent_name is None:
             raise ValueError("agent_name is required to delete a fact")
         return self.apply_changes(
-            {"deletes": [fact_id]},
+            {
+                "deletes": [fact_id],
+                "deleteRevisions": ({fact_id: expected_fact_revision} if expected_fact_revision is not None else None),
+            },
             user_id=user_id,
             agent_name=agent_name,
-            expected_manifest_revision=expected_revision,
+            expected_manifest_revision=expected_manifest_revision,
         )
 
     def get_summaries(
@@ -1251,8 +1337,15 @@ class FileMemoryStorage(MemoryStorage):
                     relative_parts = path.relative_to(root).parts
                     agents_index = relative_parts.index("agents")
                     expected_agent = relative_parts[agents_index + 1]
-                    expected_user = relative_parts[1] if len(relative_parts) > 1 and relative_parts[0] == "users" else None
-                    self._validate_loaded_fact(fact, path, user_id=expected_user, agent_name=expected_agent)
+                    expected_user_bucket = relative_parts[1] if len(relative_parts) > 1 and relative_parts[0] == "users" else None
+                    fact_scope = fact.get("scope") if isinstance(fact.get("scope"), dict) else {}
+                    original_user = fact_scope.get("userId")
+                    if original_user is not None and not isinstance(original_user, str):
+                        raise MemoryStorageCorruption(f"Fact scope userId is invalid for {path}")
+                    if expected_user_bucket is not None and (original_user is None or safe_user_id(original_user) != expected_user_bucket):
+                        raise MemoryStorageCorruption(f"Fact user scope does not match directory for {path}")
+                    validate_agent_name(expected_agent)
+                    self._validate_loaded_fact(fact, path, user_id=original_user, agent_name=expected_agent)
                     self.notify_fact_upsert(fact, path=str(path))
                     indexed += 1
                 except Exception:

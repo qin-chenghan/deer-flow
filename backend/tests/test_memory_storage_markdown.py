@@ -1,20 +1,25 @@
 """File/JSON + single-fact Markdown storage contract tests."""
 
 import copy
+import gc
 import json
 import os
 import shutil
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
+from deerflow.agents.memory import MemoryCorruptionError
 from deerflow.agents.memory.backends.deermem.deer_mem import DeerMem
 from deerflow.agents.memory.backends.deermem.deermem.config import DeerMemConfig
 from deerflow.agents.memory.backends.deermem.deermem.core import storage as storage_module
 from deerflow.agents.memory.backends.deermem.deermem.core.paths import fact_file_path
 from deerflow.agents.memory.backends.deermem.deermem.core.storage import (
     FileMemoryStorage,
+    MemoryFactRevisionConflict,
+    MemoryManifestRevisionConflict,
     MemoryRevisionConflict,
     MemoryStorageCorruption,
     create_empty_memory,
@@ -198,7 +203,13 @@ def test_prepared_journal_restores_previous_manifest_and_fact(storage: FileMemor
 
 
 def test_fact_repository_applies_upsert_and_physical_delete(storage: FileMemoryStorage) -> None:
-    first = storage.upsert_fact(_memory_with_fact()["facts"][0], user_id="alice", agent_name="agent-a", expected_revision=0)
+    first = storage.upsert_fact(
+        _memory_with_fact()["facts"][0],
+        user_id="alice",
+        agent_name="agent-a",
+        expected_manifest_revision=0,
+        expected_fact_revision=None,
+    )
     assert first["revision"] == 1
     assert first["complete"] is False
     assert storage.get_fact("fact_01HZZZZZZZZZZZZZZZZZZZZZZZ", user_id="alice", agent_name="agent-a")["content"] == "Project uses Python 3.12"
@@ -216,13 +227,67 @@ def test_fact_repository_applies_upsert_and_physical_delete(storage: FileMemoryS
     memory_path = storage._get_memory_file_path("agent-a", user_id="alice")
     fact_path = fact_file_path(memory_path, updated["id"], agent_name="agent-a")
     assert fact_path.exists()
-    third = storage.delete_fact(updated["id"], user_id="alice", agent_name="agent-a", expected_revision=2)
+    third = storage.delete_fact(
+        updated["id"],
+        user_id="alice",
+        agent_name="agent-a",
+        expected_manifest_revision=2,
+        expected_fact_revision=second["upsertedFacts"][0]["revision"],
+    )
     assert third["deletedFactIds"] == [updated["id"]]
     assert not fact_path.exists()
 
 
+def test_upsert_fact_uses_separate_manifest_and_fact_revisions(storage: FileMemoryStorage) -> None:
+    created = storage.upsert_fact(
+        _memory_with_fact("first")["facts"][0],
+        user_id="alice",
+        agent_name="agent-a",
+        expected_manifest_revision=0,
+        expected_fact_revision=None,
+    )
+    changed = copy.deepcopy(created["upsertedFacts"][0])
+    changed["content"] = "updated"
+
+    updated = storage.upsert_fact(
+        changed,
+        user_id="alice",
+        agent_name="agent-a",
+        expected_manifest_revision=created["revision"],
+        expected_fact_revision=changed["revision"],
+    )
+
+    assert updated["upsertedFacts"][0]["content"] == "updated"
+
+
+def test_revision_conflicts_have_stable_manifest_and_fact_subtypes(storage: FileMemoryStorage) -> None:
+    storage.upsert_fact(
+        _memory_with_fact("first")["facts"][0],
+        user_id="alice",
+        agent_name="agent-a",
+        expected_manifest_revision=0,
+        expected_fact_revision=None,
+    )
+
+    with pytest.raises(MemoryManifestRevisionConflict):
+        storage.apply_changes(
+            {"summaries": {"user": {}, "history": {}}},
+            user_id="alice",
+            expected_manifest_revision=0,
+        )
+
+    with pytest.raises(MemoryFactRevisionConflict):
+        storage.upsert_fact(
+            _memory_with_fact("duplicate")["facts"][0],
+            user_id="alice",
+            agent_name="agent-a",
+            expected_manifest_revision=1,
+            expected_fact_revision=None,
+        )
+
+
 def test_search_facts_declares_and_uses_substring_fallback(storage: FileMemoryStorage) -> None:
-    storage.upsert_fact(_memory_with_fact()["facts"][0], user_id="alice", agent_name="agent-a", expected_revision=0)
+    storage.upsert_fact(_memory_with_fact()["facts"][0], user_id="alice", agent_name="agent-a", expected_manifest_revision=0)
 
     results = storage.search_facts(
         "python",
@@ -240,7 +305,7 @@ def test_strict_scope_and_custom_manifest_filename(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="user_id"):
         strict.load()
 
-    strict.upsert_fact(_memory_with_fact()["facts"][0], user_id="alice", agent_name="agent-a", expected_revision=0)
+    strict.upsert_fact(_memory_with_fact()["facts"][0], user_id="alice", agent_name="agent-a", expected_manifest_revision=0)
     assert (tmp_path / "users" / "alice" / "index.json").exists()
 
 
@@ -274,7 +339,7 @@ def test_first_agent_load_removes_legacy_per_agent_memory_json(storage: FileMemo
 
 def test_fact_repository_requires_agent_name(storage: FileMemoryStorage) -> None:
     with pytest.raises(ValueError, match="agent_name"):
-        storage.upsert_fact(_memory_with_fact()["facts"][0], user_id="alice", expected_revision=0)
+        storage.upsert_fact(_memory_with_fact()["facts"][0], user_id="alice", expected_manifest_revision=0)
 
 
 def test_full_save_rejects_non_object_facts_without_deleting_existing(storage: FileMemoryStorage) -> None:
@@ -384,7 +449,7 @@ def test_old_implicit_lead_agent_bucket_moves_to_reserved_default(tmp_path: Path
         _memory_with_fact("fact written by the previous PR version")["facts"][0],
         user_id="alice",
         agent_name="lead-agent",
-        expected_revision=0,
+        expected_manifest_revision=0,
     )
 
     manager = DeerMem(backend_config={"storage_path": str(tmp_path)})
@@ -402,7 +467,7 @@ def test_old_implicit_bucket_with_unknown_files_is_preserved(tmp_path: Path) -> 
     unknown.write_text("possibly a partially created custom agent", encoding="utf-8")
     manager = DeerMem(backend_config={"storage_path": str(tmp_path)})
 
-    with pytest.raises(MemoryStorageCorruption, match="unexpected entries"):
+    with pytest.raises(MemoryCorruptionError, match="unexpected entries"):
         manager.get_memory(user_id="alice")
 
     assert unknown.read_text(encoding="utf-8") == "possibly a partially created custom agent"
@@ -474,16 +539,16 @@ def test_fact_schema_rejects_invalid_collection_and_revision_types(storage: File
     invalid_topics = _memory_with_fact()["facts"][0]
     invalid_topics["topics"] = "python"
     with pytest.raises(ValueError, match="topics"):
-        storage.upsert_fact(invalid_topics, user_id="alice", agent_name="agent-a", expected_revision=0)
+        storage.upsert_fact(invalid_topics, user_id="alice", agent_name="agent-a", expected_manifest_revision=0)
 
     invalid_revision = _memory_with_fact()["facts"][0]
     invalid_revision["revision"] = []
     with pytest.raises(ValueError, match="revision"):
-        storage.upsert_fact(invalid_revision, user_id="alice", agent_name="agent-a", expected_revision=0)
+        storage.upsert_fact(invalid_revision, user_id="alice", agent_name="agent-a", expected_manifest_revision=0)
 
 
 def test_changed_fact_increments_revision_and_updated_at(storage: FileMemoryStorage) -> None:
-    created = storage.upsert_fact(_memory_with_fact()["facts"][0], user_id="alice", agent_name="agent-a", expected_revision=0)
+    created = storage.upsert_fact(_memory_with_fact()["facts"][0], user_id="alice", agent_name="agent-a", expected_manifest_revision=0)
     original = created["upsertedFacts"][0]
     updated = copy.deepcopy(original)
     updated["content"] = "Project uses Python 3.13"
@@ -637,6 +702,58 @@ def test_rebuild_index_continues_after_adapter_exception(tmp_path: Path) -> None
     result = scoped.rebuild_index([{"userId": "alice", "agentName": "agent-a"}])
 
     assert result == {"supported": True, "indexed": 1, "failed": 1}
+
+
+def test_full_rebuild_index_accepts_original_email_user_scope(tmp_path: Path) -> None:
+    class RecordingRetrieval:
+        def __init__(self) -> None:
+            self.fact_ids: list[str] = []
+
+        def upsert(self, fact, *, scope, path):
+            self.fact_ids.append(fact["id"])
+
+        def remove(self, fact_id, *, scope):
+            pass
+
+        def search(self, query, *, scopes, top_k, mode, filters):
+            return []
+
+    retrieval = RecordingRetrieval()
+    scoped = FileMemoryStorage(DeerMemConfig(storage_path=str(tmp_path)), retrieval=retrieval)
+    scoped.upsert_fact(
+        _memory_with_fact("email user fact")["facts"][0],
+        user_id="test@example.com",
+        agent_name="agent-a",
+        expected_manifest_revision=0,
+        expected_fact_revision=None,
+    )
+    retrieval.fact_ids.clear()
+
+    result = scoped.rebuild_index()
+
+    assert result == {"supported": True, "indexed": 1, "failed": 0}
+    assert retrieval.fact_ids == ["fact_01HZZZZZZZZZZZZZZZZZZZZZZZ"]
+
+
+def test_scope_lock_cache_releases_unused_entries(storage: FileMemoryStorage) -> None:
+    key = storage._cache_key("agent-a", user_id="alice")
+    lock = storage._scope_lock(key)
+    lock_ref = weakref.ref(lock)
+    del lock
+    gc.collect()
+
+    assert lock_ref() is None
+    assert key not in storage._scope_locks
+
+
+def test_atomic_write_syncs_parent_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    synced: list[Path] = []
+    monkeypatch.setattr(storage_module, "_fsync_parent_directory", lambda path: synced.append(path))
+    target = tmp_path / "nested" / "memory.json"
+
+    storage_module._atomic_write(target, b"{}")
+
+    assert synced == [target.parent]
 
 
 def test_migrate_reports_legacy_agent_file(storage: FileMemoryStorage) -> None:
