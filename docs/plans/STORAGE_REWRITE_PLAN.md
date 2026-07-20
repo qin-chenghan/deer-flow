@@ -11,7 +11,7 @@ Separate durable memory into two ownership layers:
 user_id
 ├── memory.json                    # project-independent user/history summaries
 └── agents/{agent_name}/facts/     # agent-related atomic facts
-    └── {id-prefix}/{fact_id}.md
+    └── {sha256-prefix}/{fact_id}.md
 ```
 
 The rewrite must:
@@ -39,16 +39,17 @@ The rewrite must:
 ```text
 {storage_root}/users/{safe_user_id}/
 ├── memory.json
+├── memory.json.v1.bak             # retained only after migrating this v1 source
 ├── .memory.lock
 ├── .memory.journal.json          # exists only during/recovering a transaction
 ├── .recovery/                    # transaction backups
 └── agents/
     ├── __default__/
-    │   └── facts/{prefix}/{fact_id}.md
+    │   └── facts/{sha256-prefix}/{fact_id}.md
     └── {custom-agent}/
         ├── config.yaml           # owned by the custom-agent subsystem
         ├── SOUL.md
-        └── facts/{prefix}/{fact_id}.md
+        └── facts/{sha256-prefix}/{fact_id}.md
 ```
 
 `memory.json` contains only:
@@ -64,6 +65,8 @@ The rewrite must:
 ```
 
 It never contains facts, fact paths, hashes, embeddings, or a fact manifest.
+
+`sha256-prefix` is the first two hexadecimal characters of `SHA-256(fact_id)`, giving a deterministic 256-way shard that also distributes generated `fact_*` IDs.
 
 ## 4. Scope rules
 
@@ -166,15 +169,17 @@ This preserves Clear All/scoped-clear meaning and the `max_facts` invariant.
 
 ## 9. Cache model
 
-Every supported fact mutation advances and atomically replaces the shared `memory.json`. Its file signature is therefore an O(1) invalidation token for every agent cache belonging to that user.
+Every supported fact mutation advances and atomically replaces the shared `memory.json`. Cache validation uses `(mtime_ns, file_size, revision)` from that file. The persisted revision prevents a stale hit when a coarse-mtime filesystem reports identical metadata for same-size writes.
 
-The read path does not glob/stat every Markdown fact merely to validate a cache hit. Direct out-of-band edits to Markdown require an explicit `reload()` or restart.
+The read path does not glob/stat every Markdown fact merely to validate a cache hit, so validation cost does not grow with the number of fact files. It reads the shared JSON revision on every check. Direct out-of-band edits to Markdown require an explicit `reload()` or restart.
 
 Inactive per-scope locks are weakly cached and may be garbage-collected.
 
 ## 10. Migration
 
 The first normal default read detects legacy facts in `memory.json`, acquires the normal locks, and migrates them into `__default__`. User/history summaries are preserved and the JSON is rewritten without `facts`.
+
+The v1-to-v2 migration is one-way for the running application because pre-PR code does not read Markdown facts. Operators must stop DeerFlow and create a filesystem snapshot or full backup of the configured storage root before upgrading a persistent deployment. Before the first destructive v2 write, storage atomically and durably retains every migrated JSON source as `{source_filename}.v1.bak`. An existing backup is never overwritten: if it differs from the source, or if the backup cannot be written, migration stops before changing v1 data. These local backups preserve pre-migration data only and do not replace the required full snapshot.
 
 An optional idempotent operator CLI supports preflight audits and proactive migration:
 
@@ -197,7 +202,7 @@ fact format = Markdown
 journal = enabled
 ```
 
-These are not public choices. Deprecated `fact_format: markdown` and `journal_enabled: true` values are accepted and ignored for upgrade compatibility; unsupported alternatives fail with an explicit configuration error.
+These are implementation invariants, not public `DeerMemConfig` fields. If `fact_format` or `journal_enabled` is supplied in `backend_config`, it follows the normal unknown-key behavior: DeerMem logs a warning and ignores it.
 
 ## 12. Acceptance criteria
 
@@ -210,5 +215,6 @@ These are not public choices. Deprecated `fact_format: markdown` and `journal_en
 - Scoped clear either clears facts committed before its successful revision or returns conflict.
 - Legacy global facts migrate through normal reads and the CLI.
 - Public source remains a string.
-- Supported cache hits are O(1).
+- Cache validation does not scale with the number of fact files and includes the persisted revision.
+- Every destructive v1 JSON source is durably backed up before migration.
 - Tests cover Windows locking, POSIX directory sync, recovery, migration, concurrency, API compatibility, and portability.

@@ -112,5 +112,5 @@ def fact_file_path(memory_path: Path, fact_id: str, *, agent_name: str) -> Path:
     """Return the sharded Markdown path for one agent-owned fact."""
     if not fact_id or not re.fullmatch(r"[A-Za-z0-9_-]+", fact_id):
         raise ValueError("Fact id may contain only letters, numbers, '_' and '-'.")
-    prefix = fact_id[:2].lower() if len(fact_id) >= 2 else "__"
+    prefix = hashlib.sha256(fact_id.encode("utf-8")).hexdigest()[:2]
     return agent_facts_directory(memory_path, agent_name) / prefix / f"{fact_id}.md"

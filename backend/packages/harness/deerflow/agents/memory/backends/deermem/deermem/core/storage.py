@@ -128,6 +128,23 @@ def _file_signature(path: Path) -> tuple[int, int] | None:
         return None
 
 
+def _ensure_migration_backup(source_path: Path) -> Path:
+    """Durably preserve one immutable pre-migration JSON source beside it."""
+    backup_path = source_path.with_name(f"{source_path.name}.v1.bak")
+    try:
+        source_bytes = source_path.read_bytes()
+        if backup_path.exists():
+            if backup_path.read_bytes() != source_bytes:
+                raise MemoryStorageCorruption(f"Existing migration backup {backup_path} differs from source {source_path}; the original backup was kept and migration was stopped")
+            return backup_path
+        _atomic_write(backup_path, source_bytes)
+        return backup_path
+    except MemoryStorageCorruption:
+        raise
+    except OSError as exc:
+        raise OSError(f"Failed to create durable migration backup {backup_path}: {exc}") from exc
+
+
 def _normalize_category(fact: dict[str, Any]) -> None:
     raw_category = fact.get("category", "context")
     if not isinstance(raw_category, str):
@@ -408,14 +425,20 @@ class FileMemoryStorage(MemoryStorage):
         return memory_file_path(self._config, agent_name, user_id=user_id)
 
     def _scope_signature(self, path: Path, agent_name: str | None) -> tuple[Any, ...]:
-        """Track supported writes in O(1) through the shared transaction file.
+        """Track supported writes without scanning the agent's fact files.
 
         Every storage-managed fact mutation advances and atomically replaces
-        the user-level JSON, so its signature invalidates every agent cache for
-        that user without scanning all Markdown files on every read. Direct
-        out-of-band Markdown edits require ``reload()``.
+        the user-level JSON revision. Including that revision prevents stale
+        cache hits when a coarse-mtime filesystem reports identical metadata
+        for two same-size writes. Direct out-of-band Markdown edits require
+        ``reload()``.
         """
-        return (_file_signature(path),)
+        file_signature = _file_signature(path)
+        if file_signature is None:
+            return (None, None, None)
+        memory_file = self._load_memory_file(path)
+        revision = int((memory_file or {}).get("revision") or 0)
+        return (*file_signature, revision)
 
     @staticmethod
     def _validate_loaded_fact(
@@ -444,7 +467,9 @@ class FileMemoryStorage(MemoryStorage):
         for fact_path in sorted(agent_facts_directory(path, agent_name).glob("**/*.md")):
             fact = _parse_fact_markdown(fact_path)
             facts.append(self._validate_loaded_fact(fact, fact_path, user_id=user_id, agent_name=agent_name))
-        return facts
+        # Shard directories are an internal layout detail and must not change
+        # the stable fact order observed by callers.
+        return sorted(facts, key=lambda fact: str(fact["id"]))
 
     def _read_fact(self, path: Path, fact_id: str, *, user_id: str | None, agent_name: str) -> tuple[dict[str, Any] | None, Path]:
         fact_path = fact_file_path(path, fact_id, agent_name=agent_name)
@@ -822,6 +847,12 @@ class FileMemoryStorage(MemoryStorage):
                     continue
                 pending[candidate["id"]] = candidate
                 upserts.append(candidate)
+
+        # Migration is intentionally one-way for the running application.
+        # Preserve every destructive v1 JSON source before the first v2 write;
+        # a failed/mismatched backup aborts while all source data is untouched.
+        for source_path, _ in sources:
+            _ensure_migration_backup(source_path)
 
         current_revision = int((global_memory or {}).get("revision") or 0)
         self._commit_changes_locked(

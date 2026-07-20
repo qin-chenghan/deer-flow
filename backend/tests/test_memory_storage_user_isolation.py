@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from deerflow.agents.memory.backends.deermem.deermem.config import DeerMemConfig
+from deerflow.agents.memory.backends.deermem.deermem.core.paths import fact_file_path
 from deerflow.agents.memory.backends.deermem.deermem.core.storage import FileMemoryStorage, create_empty_memory
 
 
@@ -80,9 +81,10 @@ class TestUserIsolatedStorage:
         memory = create_empty_memory()
         memory["facts"] = [{"id": "fact_agent", "content": "agent scoped"}]
         s.save(memory, "test-agent", user_id="alice")
-        assert (base_dir / "users" / "alice" / "memory.json").exists()
+        memory_path = base_dir / "users" / "alice" / "memory.json"
+        assert memory_path.exists()
         assert not (base_dir / "users" / "alice" / "agents" / "test-agent" / "memory.json").exists()
-        assert (base_dir / "users" / "alice" / "agents" / "test-agent" / "facts" / "fa" / "fact_agent.md").exists()
+        assert fact_file_path(memory_path, "fact_agent", agent_name="test-agent").exists()
 
     def test_cache_key_is_user_agent_tuple(self, base_dir: Path):
         """Cache keys must be (user_id, agent_name) tuples."""

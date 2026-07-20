@@ -9,9 +9,10 @@ Before the rewrite, facts and summaries could live together in a coarse JSON doc
 ```text
 users/alice/
 ├── memory.json
+├── memory.json.v1.bak
 └── agents/
-    ├── __default__/facts/fa/fact_a.md
-    └── research-agent/facts/fa/fact_b.md
+    ├── __default__/facts/30/fact_a.md
+    └── research-agent/facts/ee/fact_b.md
 ```
 
 `memory.json` owns project-independent summaries. Each Markdown file owns one atomic fact. No JSON fact index duplicates the Markdown repository.
@@ -36,7 +37,7 @@ Gateway code does not import DeerMem storage internals.
 
 This owns user, agent, and fact path validation. The internal `__default__` sentinel is deliberately outside the public custom-agent regular expression.
 
-Fact paths are sharded by the first two fact-ID characters so a large repository does not put every file in one directory.
+Fact paths are sharded by the first two hexadecimal characters of `SHA-256(fact_id)`. This gives deterministic direct lookup while distributing generated IDs that all begin with `fact_`.
 
 ### `deermem/core/storage.py`
 
@@ -64,7 +65,7 @@ Gateway / middleware
   -> DeerMem canonicalizes agent to __default__
   -> FileMemoryStorage.load(__default__)
   -> recover journal / migrate legacy data when needed
-  -> compare O(1) memory.json transaction signature with cache
+  -> compare memory.json (mtime_ns, file_size, revision) with cache
   -> cache hit, or parse selected agent Markdown files
   -> DeerMem converts source metadata to public strings
   -> Gateway validates and returns the compatibility document
@@ -161,9 +162,9 @@ Manual/import/consolidation sources similarly return their type string. The rich
 
 ## 9. Cache behavior
 
-The earlier cache signature scanned and statted every fact file on every `load()`. The final cache observes the shared `memory.json` signature only.
+The earlier cache signature scanned and statted every fact file on every `load()`. The final cache observes the shared `memory.json` only.
 
-Every supported storage mutation replaces that JSON and increments its revision, so another process's write invalidates cached agent documents in O(1). This may invalidate more agents than strictly necessary, but it avoids an O(n) read hot path without introducing a second manifest.
+The token is `(mtime_ns, file_size, revision)`. Every supported storage mutation replaces the JSON and increments its revision, so another process's write invalidates cached agent documents even when a coarse-mtime filesystem reports identical metadata for same-size writes. Validation reads one shared JSON and does not scale with the number of fact files. This may invalidate more agents than strictly necessary, but it avoids an O(n) fact-directory walk without introducing a second manifest.
 
 Manual out-of-band Markdown edits are not part of the supported write API and require `reload()`.
 
@@ -177,6 +178,7 @@ When a v1 `memory.json` still contains facts:
 first load/reload
   -> detect legacy facts/version
   -> acquire normal locks
+  -> durably retain every source as memory.json.v1.bak
   -> normalize facts into __default__ scope
   -> commit Markdown files and preserved summaries through the journal
   -> rewrite memory.json without facts
@@ -193,18 +195,13 @@ PYTHONPATH=. python scripts/migrate_memory_markdown.py --all-users
 
 The command is idempotent, accepts repeated `--user-id`, supports `--storage-path`, continues reporting after one user fails, and exits non-zero if any user failed. It is not required for startup.
 
+This is a one-way application migration: pre-PR code cannot read Markdown facts. Before upgrading a persistent deployment, stop DeerFlow and take a filesystem snapshot or full backup of the configured storage root. Storage also retains each destructive v1 JSON source beside its original path as `{source_filename}.v1.bak` before committing v2 data. Existing backups are immutable; a mismatch or backup-write failure aborts before changing the source. The local backup contains pre-migration data only and does not replace the full snapshot requirement.
+
 ## 11. Configuration changes
 
 `manifest_filename` and lock timeout remain configurable. Markdown format and journaling are required invariants, not modes.
 
-Old configurations containing the only formerly valid values remain readable:
-
-```yaml
-fact_format: markdown
-journal_enabled: true
-```
-
-Those values are ignored with a deprecation warning. Alternatives fail explicitly because silently accepting `journal_enabled: false` while continuing to journal would mislead operators.
+`fact_format` and `journal_enabled` are not `DeerMemConfig` fields. If supplied in `backend_config`, they follow the normal unknown-key behavior: DeerMem logs a warning and ignores them.
 
 ## 12. Agent naming
 
@@ -223,6 +220,7 @@ This gives Linux, macOS, and Windows the same behavior. A cross-layer contract t
 - Continuing collection contention: conflict after bounded retries.
 - Corrupt JSON/Markdown: stable public corruption error; original files retained.
 - Conflicting legacy summaries/facts: migration fails loudly and preserves the legacy source.
+- Missing, unreadable, or mismatched persistent v1 backup: migration stops before changing the source.
 - Retrieval adapter failure: persistence remains committed; the failure is logged/reported per fact.
 
 ## 14. Review-driven fixes retained in the implementation
@@ -241,6 +239,9 @@ This gives Linux, macOS, and Windows the same behavior. A cross-layer contract t
 - Stale default-bucket test now asserts `__default__`.
 - Snapshot-derived set operations recompute instead of replaying stale intent.
 - Cache validation no longer scans every fact on every read.
+- Cache tokens include the persisted revision to survive coarse-mtime same-size writes.
+- Fact paths shard by `SHA-256(fact_id)[:2]` rather than the constant `fa` prefix.
+- Destructive migration writes immutable `.v1.bak` sources before v2 data.
 - Fixed storage invariants are no longer presented as configurable features.
 
 ## 15. Verification map

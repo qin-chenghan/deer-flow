@@ -2,6 +2,7 @@
 
 import copy
 import gc
+import hashlib
 import json
 import os
 import shutil
@@ -159,6 +160,39 @@ def test_shared_json_signature_invalidates_cache_after_other_storage_writes(tmp_
     )
 
     assert first.load("agent-a", user_id="alice")["facts"][0]["content"] == "changed by another storage instance"
+
+
+def test_revision_invalidates_cache_when_file_metadata_signature_collides(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A coarse filesystem may report the same mtime/size for two writes."""
+    monkeypatch.setattr(storage_module, "_file_signature", lambda path: (1, 1))
+    config = DeerMemConfig(storage_path=str(tmp_path))
+    first = FileMemoryStorage(config)
+    second = FileMemoryStorage(config)
+    assert first.save(_memory_with_fact(), "agent-a", user_id="alice")
+    cached = first.load("agent-a", user_id="alice")
+    changed = copy.deepcopy(cached["facts"][0])
+    changed["content"] = "same metadata, newer repository revision"
+
+    second.apply_changes(
+        {"upserts": [changed], "upsertRevisions": {changed["id"]: changed["revision"]}},
+        user_id="alice",
+        agent_name="agent-a",
+        expected_manifest_revision=cached["revision"],
+        allow_manifest_rebase=True,
+    )
+
+    assert first.load("agent-a", user_id="alice")["facts"][0]["content"] == "same metadata, newer repository revision"
+
+
+def test_fact_paths_shard_by_sha256_id_digest(tmp_path: Path) -> None:
+    memory_path = tmp_path / "users" / "alice" / "memory.json"
+    fact_ids = ["fact_00000000", "fact_11111111", "fact_22222222", "external-123"]
+
+    paths = [fact_file_path(memory_path, fact_id, agent_name="agent-a") for fact_id in fact_ids]
+
+    for fact_id, path in zip(fact_ids, paths, strict=True):
+        assert path.parent.name == hashlib.sha256(fact_id.encode("utf-8")).hexdigest()[:2]
+    assert len({path.parent.name for path in paths}) > 1
 
 
 def test_corrupt_manifest_raises_and_is_not_treated_as_empty(storage: FileMemoryStorage) -> None:
@@ -345,6 +379,7 @@ def test_explicit_migrate_converts_legacy_json(storage: FileMemoryStorage) -> No
     path = storage._get_memory_file_path(user_id="alice")
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps(_memory_with_fact()), encoding="utf-8")
+    original = path.read_bytes()
 
     report = storage.migrate(user_id="alice", agent_name="agent-a")
 
@@ -353,6 +388,7 @@ def test_explicit_migrate_converts_legacy_json(storage: FileMemoryStorage) -> No
     assert report["toVersion"] == "2.0"
     assert "facts" not in json.loads(path.read_text(encoding="utf-8"))
     assert fact_file_path(path, "fact_01HZZZZZZZZZZZZZZZZZZZZZZZ", agent_name="agent-a").exists()
+    assert path.with_name("memory.json.v1.bak").read_bytes() == original
 
 
 def test_first_agent_load_removes_legacy_per_agent_memory_json(storage: FileMemoryStorage) -> None:
@@ -360,13 +396,53 @@ def test_first_agent_load_removes_legacy_per_agent_memory_json(storage: FileMemo
     legacy_path = user_memory_path.parent / "agents" / "agent-a" / "memory.json"
     legacy_path.parent.mkdir(parents=True)
     legacy_path.write_text(json.dumps(_memory_with_fact("legacy agent fact")), encoding="utf-8")
+    original = legacy_path.read_bytes()
 
     loaded = storage.load("agent-a", user_id="alice")
 
     assert loaded["facts"][0]["content"] == "legacy agent fact"
     assert not legacy_path.exists()
+    assert legacy_path.with_name("memory.json.v1.bak").read_bytes() == original
     assert user_memory_path.exists()
     assert "facts" not in json.loads(user_memory_path.read_text(encoding="utf-8"))
+
+
+def test_migration_rejects_a_different_existing_v1_backup(storage: FileMemoryStorage) -> None:
+    path = storage._get_memory_file_path(user_id="alice")
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(_memory_with_fact("source v1")), encoding="utf-8")
+    original = path.read_bytes()
+    path.with_name("memory.json.v1.bak").write_text(json.dumps(_memory_with_fact("older different v1")), encoding="utf-8")
+
+    with pytest.raises(MemoryStorageCorruption, match="migration backup"):
+        storage.migrate(user_id="alice", agent_name="agent-a")
+
+    assert path.read_bytes() == original
+    assert not fact_file_path(path, "fact_01HZZZZZZZZZZZZZZZZZZZZZZZ", agent_name="agent-a").exists()
+
+
+def test_migration_does_not_modify_v1_source_when_backup_write_fails(
+    storage: FileMemoryStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = storage._get_memory_file_path(user_id="alice")
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(_memory_with_fact("source v1")), encoding="utf-8")
+    original = path.read_bytes()
+    real_atomic_write = storage_module._atomic_write
+
+    def fail_backup(path_to_write: Path, raw: bytes) -> None:
+        if path_to_write.name.endswith(".v1.bak"):
+            raise OSError("backup disk unavailable")
+        real_atomic_write(path_to_write, raw)
+
+    monkeypatch.setattr(storage_module, "_atomic_write", fail_backup)
+
+    with pytest.raises(OSError, match="backup disk unavailable"):
+        storage.migrate(user_id="alice", agent_name="agent-a")
+
+    assert path.read_bytes() == original
+    assert not fact_file_path(path, "fact_01HZZZZZZZZZZZZZZZZZZZZZZZ", agent_name="agent-a").exists()
 
 
 def test_fact_repository_requires_agent_name(storage: FileMemoryStorage) -> None:
