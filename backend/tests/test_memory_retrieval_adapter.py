@@ -1,0 +1,165 @@
+"""Regression coverage for DeerMem's #4279 RetrievalPort integration."""
+
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+from deerflow.agents.memory.backends.deermem.deer_mem import DeerMem
+from deerflow.agents.memory.backends.deermem.deermem.config import DeerMemConfig
+from deerflow.agents.memory.backends.deermem.deermem.core.retrieval import FTS5RetrievalAdapter
+from deerflow.agents.memory.backends.deermem.deermem.core.storage import FileMemoryStorage
+
+
+def _fact(fact_id: str, content: str, *, category: str = "context") -> dict:
+    return {
+        "id": fact_id,
+        "content": content,
+        "category": category,
+        "confidence": 0.8,
+        "createdAt": "2026-07-21T00:00:00Z",
+        "source": {"type": "test", "threadId": None},
+    }
+
+
+def test_adapter_isolates_scopes_even_when_fact_ids_repeat(tmp_path: Path) -> None:
+    adapter = FTS5RetrievalAdapter(tmp_path / "facts.sqlite3")
+    try:
+        adapter.upsert(_fact("same", "Alice private alpha"), scope={"userId": "alice", "agentName": "__default__"}, path="")
+        adapter.upsert(_fact("same", "Bob private beta"), scope={"userId": "bob", "agentName": "__default__"}, path="")
+
+        alice = adapter.search("alpha", scopes=[{"userId": "alice", "agentName": "__default__"}], top_k=5, mode="hybrid", filters=None)
+        bob = adapter.search("alpha", scopes=[{"userId": "bob", "agentName": "__default__"}], top_k=5, mode="hybrid", filters=None)
+
+        assert [item["fact"]["content"] for item in alice] == ["Alice private alpha"]
+        assert bob == []
+    finally:
+        adapter.close()
+
+
+def test_adapter_persists_across_restart_and_supports_category_filter(tmp_path: Path) -> None:
+    db_path = tmp_path / "facts.sqlite3"
+    scope = {"userId": "alice", "agentName": "agent-a"}
+    first = FTS5RetrievalAdapter(db_path)
+    first.upsert(_fact("one", "Python deployment preference", category="preference"), scope=scope, path="")
+    first.upsert(_fact("two", "Python deployment context", category="context"), scope=scope, path="")
+    first.close()
+
+    second = FTS5RetrievalAdapter(db_path)
+    try:
+        results = second.search("Python deployment", scopes=[scope], top_k=5, mode="hybrid", filters={"category": "preference"})
+        assert [item["fact"]["id"] for item in results] == ["one"]
+        assert results[0]["matchType"] == "fts5"
+    finally:
+        second.close()
+
+
+def test_file_storage_incremental_notifications_update_and_remove_index(tmp_path: Path) -> None:
+    adapter = FTS5RetrievalAdapter(tmp_path / "facts.sqlite3")
+    storage = FileMemoryStorage(DeerMemConfig(storage_path=str(tmp_path)), retrieval=adapter)
+    scope = {"userId": "alice", "agentName": "agent-a"}
+    try:
+        storage.upsert_fact(_fact("one", "initial searchable value"), user_id="alice", agent_name="agent-a", expected_manifest_revision=0)
+        assert storage.search_facts("initial", scopes=[scope])[0]["fact"]["id"] == "one"
+
+        updated = storage.get_fact("one", user_id="alice", agent_name="agent-a")
+        assert updated is not None
+        updated["content"] = "replacement searchable value"
+        storage.upsert_fact(
+            updated,
+            user_id="alice",
+            agent_name="agent-a",
+            expected_manifest_revision=1,
+            expected_fact_revision=updated["revision"],
+        )
+        assert storage.search_facts("replacement", scopes=[scope])[0]["fact"]["id"] == "one"
+        assert storage.search_facts("initial", scopes=[scope]) == []
+
+        storage.delete_fact("one", user_id="alice", agent_name="agent-a")
+        assert storage.search_facts("replacement", scopes=[scope]) == []
+    finally:
+        adapter.close()
+
+
+def test_full_rebuild_removes_stale_rows_after_markdown_delete(tmp_path: Path) -> None:
+    adapter = FTS5RetrievalAdapter(tmp_path / "facts.sqlite3")
+    storage = FileMemoryStorage(DeerMemConfig(storage_path=str(tmp_path)), retrieval=adapter)
+    scope = {"userId": "alice", "agentName": "agent-a"}
+    try:
+        storage.upsert_fact(_fact("one", "stale markdown value"), user_id="alice", agent_name="agent-a", expected_manifest_revision=0)
+        memory_path = storage._get_memory_file_path("agent-a", user_id="alice")
+        fact_path = next(memory_path.parent.glob("agents/agent-a/facts/**/*.md"))
+        fact_path.unlink()
+
+        result = storage.rebuild_index()
+        assert result == {"supported": True, "indexed": 0, "failed": 0}
+        assert storage.search_facts("stale", scopes=[scope]) == []
+    finally:
+        adapter.close()
+
+
+def test_reload_rebuilds_index_after_out_of_band_markdown_edit(tmp_path: Path) -> None:
+    adapter = FTS5RetrievalAdapter(tmp_path / "facts.sqlite3")
+    storage = FileMemoryStorage(DeerMemConfig(storage_path=str(tmp_path)), retrieval=adapter)
+    scope = {"userId": "alice", "agentName": "agent-a"}
+    try:
+        storage.upsert_fact(_fact("one", "original markdown value"), user_id="alice", agent_name="agent-a", expected_manifest_revision=0)
+        memory_path = storage._get_memory_file_path("agent-a", user_id="alice")
+        fact_path = next(memory_path.parent.glob("agents/agent-a/facts/**/*.md"))
+        raw = fact_path.read_text(encoding="utf-8").replace("original markdown value", "edited markdown value")
+        fact_path.write_text(raw, encoding="utf-8")
+
+        storage.reload("agent-a", user_id="alice")
+        assert storage.search_facts("edited", scopes=[scope])[0]["fact"]["id"] == "one"
+        assert storage.search_facts("original", scopes=[scope]) == []
+    finally:
+        adapter.close()
+
+
+def test_failed_notification_marks_scope_dirty_and_rebuilds_on_search(tmp_path: Path) -> None:
+    adapter = FTS5RetrievalAdapter(tmp_path / "facts.sqlite3")
+    storage = FileMemoryStorage(DeerMemConfig(storage_path=str(tmp_path)), retrieval=adapter)
+    original_upsert = adapter.upsert
+    failed_once = True
+
+    def fail_once(fact, *, scope, path):
+        nonlocal failed_once
+        if failed_once:
+            failed_once = False
+            raise RuntimeError("simulated index outage")
+        original_upsert(fact, scope=scope, path=path)
+
+    adapter.upsert = fail_once  # type: ignore[method-assign]
+    try:
+        storage.upsert_fact(_fact("one", "recoverable indexed value"), user_id="alice", agent_name="agent-a", expected_manifest_revision=0)
+        results = storage.search_facts("recoverable", scopes=[{"userId": "alice", "agentName": "agent-a"}])
+        assert results[0]["fact"]["id"] == "one"
+    finally:
+        adapter.close()
+
+
+def test_concurrent_upserts_are_searchable(tmp_path: Path) -> None:
+    adapter = FTS5RetrievalAdapter(tmp_path / "facts.sqlite3")
+    scope = {"userId": "alice", "agentName": "agent-a"}
+    try:
+
+        def write(index: int) -> None:
+            adapter.upsert(_fact(f"fact-{index}", f"concurrent memory item {index}"), scope=scope, path="")
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(write, range(20)))
+        results = adapter.search("concurrent memory", scopes=[scope], top_k=20, mode="hybrid", filters=None)
+        assert {item["fact"]["id"] for item in results} == {f"fact-{index}" for index in range(20)}
+    finally:
+        adapter.close()
+
+
+def test_deermem_create_and_restart_use_retrieval_adapter(tmp_path: Path) -> None:
+    config = {"storage_path": str(tmp_path), "token_counting": "char"}
+    manager = DeerMem(backend_config=config)
+    _, fact_id = manager.create_fact("BM25 retrieval survives restart", category="knowledge", user_id="alice")
+    assert fact_id is not None
+    assert any(fact["id"] == fact_id for fact in manager.search("retrieval BM25", user_id="alice"))
+
+    restarted = DeerMem(backend_config=config)
+    assert any(fact["id"] == fact_id for fact in restarted.search("restart retrieval", user_id="alice"))

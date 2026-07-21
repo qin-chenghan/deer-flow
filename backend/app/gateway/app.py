@@ -203,6 +203,27 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception:  # observability must never break startup
         logger.exception("Monocle tracing setup failed; continuing without it")
 
+    # Rebuild the derived memory retrieval index before serving requests. This
+    # is separate from the short tiktoken probe below: an index rebuild may
+    # legitimately scan many users and must not be abandoned after five
+    # seconds while its worker thread is still mutating the shared index.
+    try:
+        from deerflow.agents.memory import get_memory_manager
+
+        if startup_config.memory.enabled:
+            manager = get_memory_manager()
+            warm_retrieval = getattr(manager, "warm_retrieval", None)
+            if callable(warm_retrieval):
+                rebuilt = await asyncio.to_thread(warm_retrieval)
+                if rebuilt:
+                    logger.info("Memory retrieval index rebuilt successfully")
+                else:
+                    logger.warning("Memory retrieval index rebuild failed; scoped searches will retry lazily")
+        else:
+            logger.info("Memory is disabled; skipping retrieval index rebuild")
+    except Exception:
+        logger.warning("Memory retrieval index rebuild skipped", exc_info=True)
+
     # Pre-warm tiktoken encoding cache so the first memory-injection request
     # never blocks on the BPE data download (which hits an OpenAI/Azure URL
     # that may be unreachable in restricted networks — see issue #3402).
