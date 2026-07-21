@@ -19,6 +19,7 @@ a fixture fact list rebuilt from scratch -- no shared state between tests.
 
 from __future__ import annotations
 
+import threading
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -206,6 +207,15 @@ class TestSyntaxFallback:
         assert engine.search("...!!!", top_k=5, scope_user="test_user") == [] or True
         # The OR fallback may produce tokens for "..."; just verify no crash
 
+    def test_natural_language_punctuation_is_safe(self):
+        eng = FTS5Retrieval(":memory:")
+        try:
+            eng.index_fact("cpp", "C compiler optimization", scope_user="u")
+            results = eng.search("C++ optimization", top_k=5, scope_user="u")
+            assert _ids(results) == {"cpp"}
+        finally:
+            eng.close()
+
 
 # ── 5. Category filtering ─────────────────────────────────────────────
 
@@ -377,6 +387,15 @@ class TestIndexSync:
         finally:
             eng.close()
 
+    def test_malformed_confidence_does_not_disable_fts(self):
+        eng = FTS5Retrieval(":memory:")
+        try:
+            eng.index_fact("bad_conf", "malformed confidence fact", confidence=None, scope_user="u")
+            results = eng.search("malformed confidence", top_k=5, scope_user="u")
+            assert _ids(results) == {"bad_conf"}
+        finally:
+            eng.close()
+
     def test_remove_then_search(self):
         eng = FTS5Retrieval(":memory:")
         try:
@@ -442,14 +461,12 @@ class TestThreadSafety:
     """
 
     def test_search_from_multiple_threads_concurrently(self):
-        """Spawn N threads that hit the engine while a writer rebuilds.
+        """Spawn N threads that hit the engine concurrently.
 
         Without the lock/check_same_thread=False pair this hits the
         'SQLite objects created in a thread can only be used in that
         same thread' guard.  With the fix it must complete cleanly.
         """
-        import threading
-
         eng = FTS5Retrieval(":memory:")
         eng.rebuild_from_facts(FIXTURE_FACTS, scope_user="u")
         try:
@@ -469,5 +486,34 @@ class TestThreadSafety:
             for t in threads:
                 t.join(timeout=5)
             assert not errors, f"thread-safety regression: {errors}"
+        finally:
+            eng.close()
+
+    def test_readers_never_observe_a_partial_rebuild(self):
+        eng = FTS5Retrieval(":memory:")
+        eng.rebuild_from_facts(FIXTURE_FACTS, scope_user="u")
+        try:
+            errors: list[str] = []
+            barrier = threading.Barrier(5)
+
+            def reader() -> None:
+                barrier.wait(timeout=5)
+                for _ in range(20):
+                    if "f08" not in _ids(eng.search("kubernetes", scope_user="u", top_k=5)):
+                        errors.append("reader observed a partial index")
+
+            def writer() -> None:
+                barrier.wait(timeout=5)
+                for _ in range(20):
+                    eng.rebuild_from_facts(FIXTURE_FACTS, scope_user="u")
+
+            threads = [threading.Thread(target=reader) for _ in range(4)] + [threading.Thread(target=writer)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+
+            assert not errors
+            assert all(not thread.is_alive() for thread in threads)
         finally:
             eng.close()

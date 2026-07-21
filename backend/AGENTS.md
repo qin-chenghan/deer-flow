@@ -599,6 +599,7 @@ The cached value is reused for both the blocking (`runs.wait`) and streaming (`_
 - `queue.py` - Debounced update queue (per-thread deduplication, configurable wait time); captures `user_id` at enqueue time so it survives the `threading.Timer` boundary
 - `prompt.py` - Prompt templates for memory updates
 - `storage.py` - File-based storage with per-user isolation; cache keyed by `(user_id, agent_name)` tuple
+- `deermem/core/retrieval.py` - Scope-keyed in-memory SQLite FTS5 index with jieba tokenization, BM25 ranking, and snapshot refresh after background writes
 - `tools.py` - Tool-driven memory mode (`memory_search`, `memory_add`, `memory_update`, `memory_delete`) using the same storage/update primitives
 
 **Per-User Isolation**:

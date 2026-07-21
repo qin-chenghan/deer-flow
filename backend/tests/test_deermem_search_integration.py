@@ -78,8 +78,8 @@ def _build_deer_mem(storage_path: str | Path) -> DeerMem:
     so the test does not depend on ``runtime_home()`` (which would inject
     a host-default directory the test can't easily predict).
 
-    The FTS5 retrieval index is lazily built on the first ``search()`` call,
-    so we explicitly mark it dirty before returning.
+    The scope-keyed FTS5 retrieval index is lazily built on the first
+    ``search()`` call.
     """
     config = DeerMemConfig.from_backend_config(
         {
@@ -99,8 +99,6 @@ def _build_deer_mem(storage_path: str | Path) -> DeerMem:
     mgr._llm = None
     mgr._updater = MemoryUpdater(config, mgr._storage, None)
     mgr._queue = None  # not used in tests
-    mgr._retrieval = None
-    mgr._retrieval_dirty = True
     return mgr
 
 
@@ -238,6 +236,16 @@ class TestUserIsolation:
         assert any(r["id"] == "b01" for r in bob_results)
         assert not any(r["id"] == "a01" for r in bob_results)
 
+    def test_scope_switch_does_not_reuse_another_users_index(self, tmp_storage):
+        """A non-contiguous query must still work after another scope was searched."""
+        _write_memory_file(tmp_storage / "users" / "alice" / "memory.json", [_make_fact("a01", "alpha project details", "knowledge", 0.9)])
+        _write_memory_file(tmp_storage / "users" / "bob" / "memory.json", [_make_fact("b01", "beta private roadmap", "knowledge", 0.9)])
+
+        mgr = _build_deer_mem(tmp_storage)
+        assert any(r["id"] == "a01" for r in mgr.search("details alpha", user_id="alice"))
+        results = mgr.search("roadmap beta", user_id="bob")
+        assert any(r["id"] == "b01" for r in results)
+
 
 # ── 5. CRUD: create_fact then search then delete then re-search ───────
 
@@ -283,6 +291,37 @@ class TestCrudSync:
         # After clear, all searches return empty
         assert mgr.search("alpha", top_k=5, user_id=user_id) == []
         assert mgr.search("beta", top_k=5, user_id=user_id) == []
+
+    def test_background_updater_changes_are_visible_after_index_warmup(self, tmp_storage):
+        """Search must notice facts written through the async updater path."""
+        user_id = "background_user"
+        _write_memory_file(tmp_storage / "users" / user_id / "memory.json", [_make_fact("old", "existing memory item")])
+
+        mgr = _build_deer_mem(tmp_storage)
+        mgr.search("existing item", user_id=user_id)
+        _, fact_id = mgr._updater.create_memory_fact(
+            "freshly extracted background memory",
+            category="knowledge",
+            confidence=0.9,
+            user_id=user_id,
+        )
+
+        results = mgr.search("memory freshly", user_id=user_id)
+        assert any(r["id"] == fact_id for r in results)
+
+
+class TestFtsResultPayload:
+    """FTS ranking must not mutate the fact payload returned to callers."""
+
+    def test_preserves_original_content_and_source(self, tmp_storage):
+        user_id = "payload_user"
+        original = _make_fact("payload1", "用户偏好使用中文交流", "preference", 0.9)
+        _write_memory_file(tmp_storage / "users" / user_id / "memory.json", [original])
+
+        results = _build_deer_mem(tmp_storage).search("中文交流", user_id=user_id)
+        result = next(r for r in results if r["id"] == "payload1")
+        assert result["content"] == original["content"]
+        assert result["source"] == original["source"]
 
 
 # ── 6. FTS5 vs substring fallback parity ──────────────────────────────

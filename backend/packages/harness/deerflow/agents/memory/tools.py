@@ -59,8 +59,9 @@ def memory_search_tool(
     - their preferences, past corrections, context, or any stored facts.
 
     Args:
-        query: Natural language query to match against fact content.
-            Case-insensitive substring matching.
+        query: Natural language query to match against fact content. Results
+            use FTS5 token matching with BM25 ranking and fall back to
+            case-insensitive substring matching when full-text search fails.
         category: Optional category filter (e.g. "preference", "correction",
             "context"). Only facts with this exact category are returned.
         limit: Maximum results to return (default 10).

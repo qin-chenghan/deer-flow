@@ -80,8 +80,6 @@ def main():
 
     manager._updater = MemoryUpdater(config, manager._storage, None)
     manager._queue = None
-    manager._retrieval = None
-    manager._retrieval_dirty = True
 
     user = "test_user"
     agent = None
@@ -189,7 +187,6 @@ def main():
     old_fact = facts[-1]
     old_fact["createdAt"] = old_date
     manager._updater._storage.save(memory_data, agent_name=None, user_id=user)
-    manager._retrieval_dirty = True
 
     results = manager.search("FTS5 memory architecture", top_k=5, user_id=user)
     print_results(results, "60天前的旧数据应排后面")

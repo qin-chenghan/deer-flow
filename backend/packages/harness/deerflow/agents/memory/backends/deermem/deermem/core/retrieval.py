@@ -12,6 +12,7 @@ This module is internal to DeerMem -- not on the MemoryManager ABC.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import re
@@ -74,10 +75,13 @@ def _is_advanced_query(query: str) -> bool:
 
 def _build_fallback_query(query: str) -> str:
     """Convert natural-language query to FTS5 OR query (fallback strategy)."""
-    tokens = _tokenize(query)
+    tokens = [token for token in _tokenize(query) if any(char.isalnum() for char in token)]
     if not tokens:
         return ""
-    return " OR ".join(tokens)
+    # Quote each token so punctuation in natural-language input cannot become
+    # an FTS5 operator or syntax error. Double quotes inside a token are the
+    # FTS5 escape sequence for a literal quote.
+    return " OR ".join(f'"{token.replace(chr(34), chr(34) * 2)}"' for token in tokens)
 
 
 # ── Core retrieval engine ─────────────────────────────────────────────
@@ -109,7 +113,7 @@ class FTS5Retrieval:
         #      reorderings). Callers from outside instance methods MUST enter
         #      the lock via the public API and not bypass into ``self._conn``.
         self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._init_schema()
 
@@ -120,11 +124,14 @@ class FTS5Retrieval:
             CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
                 doc_id UNINDEXED,
                 content,
+                raw_content UNINDEXED,
                 category UNINDEXED,
                 scope_user UNINDEXED,
                 scope_agent UNINDEXED,
                 created_at UNINDEXED,
                 confidence UNINDEXED,
+                source UNINDEXED,
+                fact_json UNINDEXED,
                 tokenize='unicode61'
             )
             """
@@ -151,6 +158,8 @@ class FTS5Retrieval:
         created_at: str | None = None,
         scope_user: str | None = None,
         scope_agent: str | None = None,
+        source: str | None = None,
+        fact_data: dict[str, Any] | None = None,
     ) -> None:
         """Insert or update a fact in the FTS5 index."""
         with self._lock:
@@ -162,10 +171,23 @@ class FTS5Retrieval:
             conn.execute("DELETE FROM memory_fts WHERE doc_id = ?", (fact_id,))
             conn.execute(
                 """
-                INSERT INTO memory_fts(doc_id, content, category, scope_user, scope_agent, created_at, confidence)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO memory_fts(
+                    doc_id, content, raw_content, category, scope_user, scope_agent,
+                    created_at, confidence, source, fact_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (fact_id, indexed_content, category, scope_user or "", scope_agent or "", created_at or now, confidence),
+                (
+                    fact_id,
+                    indexed_content,
+                    content,
+                    category,
+                    scope_user or "",
+                    scope_agent or "",
+                    created_at or now,
+                    confidence,
+                    source,
+                    json.dumps(fact_data, ensure_ascii=False, default=str) if fact_data is not None else None,
+                ),
             )
             conn.commit()
 
@@ -191,21 +213,41 @@ class FTS5Retrieval:
         scope_agent: str | None = None,
     ) -> None:
         """Rebuild the entire index from a list of fact dicts."""
-        self.clear_index()
-        for fact in facts:
-            fact_id = fact.get("id", "")
-            content = fact.get("content", "")
-            if not fact_id or not content:
-                continue
-            self.index_fact(
-                fact_id,
-                content,
-                category=fact.get("category", "context"),
-                confidence=fact.get("confidence", 0.5),
-                created_at=fact.get("createdAt"),
-                scope_user=scope_user,
-                scope_agent=scope_agent,
-            )
+        with self._lock:
+            conn = self._conn
+            try:
+                conn.execute("BEGIN")
+                conn.execute("DELETE FROM memory_fts")
+                for fact in facts:
+                    fact_id = fact.get("id", "")
+                    content = fact.get("content", "")
+                    if not fact_id or not isinstance(content, str) or not content:
+                        continue
+                    now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+                    conn.execute(
+                        """
+                        INSERT INTO memory_fts(
+                            doc_id, content, raw_content, category, scope_user, scope_agent,
+                            created_at, confidence, source, fact_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            fact_id,
+                            self._preprocess_content(content),
+                            content,
+                            fact.get("category", "context"),
+                            scope_user or "",
+                            scope_agent or "",
+                            fact.get("createdAt") or now,
+                            fact.get("confidence", 0.5),
+                            fact.get("source"),
+                            json.dumps(fact, ensure_ascii=False, default=str),
+                        ),
+                    )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
 
     # ── Search ─────────────────────────────────────────────────────────
 
@@ -309,8 +351,8 @@ class FTS5Retrieval:
         where_clause = " AND ".join(conditions)
 
         sql = f"""
-            SELECT doc_id, content, category, scope_user, scope_agent,
-                   created_at, confidence,
+            SELECT doc_id, content, raw_content, category, scope_user, scope_agent,
+                   created_at, confidence, source, fact_json,
                    bm25(memory_fts) AS bm25_score
             FROM memory_fts
             WHERE {where_clause}
@@ -331,12 +373,15 @@ class FTS5Retrieval:
         for row in rows:
             (
                 doc_id,
-                content,
+                indexed_content,
+                raw_content,
                 cat,
                 s_user,
                 s_agent,
                 created_at,
                 confidence,
+                source,
+                fact_json,
                 bm25_score,
             ) = row
 
@@ -346,18 +391,23 @@ class FTS5Retrieval:
                 created_at=created_at,
             )
 
-            results.append(
-                {
-                    "id": doc_id,
-                    "content": content,
-                    "category": cat,
-                    "confidence": confidence,
-                    "createdAt": created_at,
-                    "source": "fts5",
-                    "score": score,
-                    "bm25_score": -bm25_score,
-                }
-            )
+            fact: dict[str, Any] = {}
+            if fact_json:
+                try:
+                    decoded = json.loads(fact_json)
+                    if isinstance(decoded, dict):
+                        fact = decoded
+                except (TypeError, ValueError):
+                    logger.debug("FTS5 fact metadata was not valid JSON for doc_id=%r", doc_id)
+            fact.setdefault("id", doc_id)
+            fact.setdefault("content", raw_content if raw_content is not None else indexed_content)
+            fact.setdefault("category", cat)
+            fact.setdefault("confidence", confidence)
+            fact.setdefault("createdAt", created_at)
+            fact.setdefault("source", source if source is not None else "fts5")
+            fact["score"] = score
+            fact["bm25_score"] = -bm25_score
+            results.append(fact)
 
         logger.debug(
             "FTS5 raw SQL: fts5_query=%r scope_user=%r scope_agent=%r category=%r -> %d rows. bm25 raw: %s",
@@ -391,18 +441,24 @@ class FTS5Retrieval:
             age_days = (datetime.now(UTC) - dt).days
             time_decay = 1.0 if age_days < 30 else math.exp(-0.01 * (age_days - 30))
             score *= time_decay
-        except (ValueError, TypeError):
+        except (AttributeError, ValueError, TypeError):
             time_decay = -1.0  # sentinel for "unparseable" → skipped decay
             age_days = -1
 
-        score += confidence * _CONFIDENCE_WEIGHT
+        try:
+            normalized_confidence = float(confidence)
+            if not math.isfinite(normalized_confidence):
+                raise ValueError
+        except (TypeError, ValueError):
+            normalized_confidence = 0.5
+        score += normalized_confidence * _CONFIDENCE_WEIGHT
 
         logger.debug(
             "_compute_final_score: bm25_in=%.4f time_decay=%s age_days=%s conf=%.2f -> final=%.4f",
             bm25_score,
             time_decay,
             age_days,
-            confidence,
+            normalized_confidence,
             score,
         )
         return score

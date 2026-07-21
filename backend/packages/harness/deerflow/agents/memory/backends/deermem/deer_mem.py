@@ -23,7 +23,11 @@ never breaks those modules at import time (see MemoryManager plan, step 8).
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import threading
+from collections import OrderedDict
 from typing import Any
 
 from deerflow.agents.memory.manager import MemoryManager
@@ -43,6 +47,8 @@ from .deermem.core.storage import create_storage
 from .deermem.core.updater import MemoryUpdater, _coerce_source_confidence
 
 logger = logging.getLogger(__name__)
+
+_RETRIEVAL_CACHE_MAX_SCOPES = 64
 
 
 class DeerMem(MemoryManager):
@@ -86,9 +92,9 @@ class DeerMem(MemoryManager):
             load_prompt("consolidation", prompts_dir=self._config.prompts_dir).format(consolidation_groups="", max_groups=1)
             load_prompt_messages("memory_update", _dummy_vars, prompts_dir=self._config.prompts_dir)
         self._queue = MemoryUpdateQueue(self._config, self._updater)
-        # FTS5 retrieval engine (in-memory; rebuilt lazily on first search)
-        self._retrieval: FTS5Retrieval | None = None
-        self._retrieval_dirty = True  # index needs rebuild
+        # Scope-keyed FTS5 indexes (in-memory; rebuilt lazily on first search).
+        self._retrieval_indexes: OrderedDict[tuple[str | None, str | None], tuple[FTS5Retrieval, str]] = OrderedDict()
+        self._retrieval_lock = threading.RLock()
 
     # ── Write ────────────────────────────────────────────────────────────
     def add(
@@ -232,37 +238,51 @@ class DeerMem(MemoryManager):
         return fallback_result
 
     def _ensure_retrieval_index(self, user_id: str | None, agent_name: str | None) -> FTS5Retrieval | None:
-        """Lazily build/rebuild the FTS5 index from current facts."""
+        """Return the current FTS5 index for one memory scope.
+
+        The memory updater writes asynchronously, so a boolean dirty flag is
+        insufficient: the snapshot fingerprint is checked on every search.
+        Indexes are scoped by user and agent to prevent one request from
+        reusing another request's in-memory snapshot.
+        """
         import time
 
         _t0 = time.perf_counter()
-        is_new_instance = self._retrieval is None
-        if is_new_instance:
-            self._retrieval = FTS5Retrieval(":memory:")
-            self._retrieval_dirty = True
-            logger.debug("FTS5 index: created new FTS5Retrieval instance (id=%s)", id(self._retrieval))
-        if self._retrieval_dirty:
+        lock = getattr(self, "_retrieval_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._retrieval_lock = lock
+        with lock:
             memory_data = self._updater.get_memory_data(agent_name=agent_name, user_id=user_id)
-            facts = memory_data.get("facts", [])
-            cache_info = memory_data.get("_cache_debug", {}) if isinstance(memory_data, dict) else {}
-            logger.debug(
-                "FTS5 index: dirty=True, rebuilding from %d facts (user=%r agent=%r, storage cache mtime=%s)",
-                len(facts),
-                user_id,
-                agent_name,
-                cache_info,
-            )
-            self._retrieval.rebuild_from_facts(facts, scope_user=user_id, scope_agent=agent_name)
-            self._retrieval_dirty = False
-        else:
-            logger.debug(
-                "FTS5 index: dirty=False, reusing (instance_id=%s, user=%r agent=%r)",
-                id(self._retrieval),
-                user_id,
-                agent_name,
-            )
+            raw_facts = memory_data.get("facts", []) if isinstance(memory_data, dict) else []
+            facts = raw_facts if isinstance(raw_facts, list) else []
+            fingerprint = hashlib.sha256(json.dumps(facts, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")).hexdigest()
+            indexes = getattr(self, "_retrieval_indexes", None)
+            if indexes is None:
+                indexes = OrderedDict()
+                self._retrieval_indexes = indexes
+            scope_key = (user_id, agent_name)
+            cached = indexes.get(scope_key)
+            if cached is None:
+                retrieval = FTS5Retrieval(":memory:")
+                logger.debug("FTS5 index: created scope=%r instance_id=%s", scope_key, id(retrieval))
+            else:
+                retrieval, cached_fingerprint = cached
+                if cached_fingerprint == fingerprint:
+                    indexes.move_to_end(scope_key)
+                    logger.debug("FTS5 index: reusing scope=%r instance_id=%s", scope_key, id(retrieval))
+                    return retrieval
+
+            logger.debug("FTS5 index: rebuilding %d facts for scope=%r", len(facts), scope_key)
+            retrieval.rebuild_from_facts(facts, scope_user=user_id, scope_agent=agent_name)
+            indexes[scope_key] = (retrieval, fingerprint)
+            indexes.move_to_end(scope_key)
+            while len(indexes) > _RETRIEVAL_CACHE_MAX_SCOPES:
+                evicted_scope, (evicted_retrieval, _) = indexes.popitem(last=False)
+                evicted_retrieval.close()
+                logger.debug("FTS5 index: evicted scope=%r instance_id=%s", evicted_scope, id(evicted_retrieval))
         logger.debug("FTS5 index: ensure took %.3fms", (time.perf_counter() - _t0) * 1000)
-        return self._retrieval
+        return retrieval
 
     def _fts5_search(
         self,
@@ -278,17 +298,22 @@ class DeerMem(MemoryManager):
 
         _t0 = time.perf_counter()
         try:
-            retrieval = self._ensure_retrieval_index(user_id, agent_name)
-            if retrieval is None:
-                logger.debug("FTS5 search: ensure returned None, skipping (user=%r)", user_id)
-                return []
-            results = retrieval.search(
-                query,
-                scope_user=user_id,
-                scope_agent=agent_name,
-                category=category,
-                top_k=top_k,
-            )
+            lock = getattr(self, "_retrieval_lock", None)
+            if lock is None:
+                lock = threading.RLock()
+                self._retrieval_lock = lock
+            with lock:
+                retrieval = self._ensure_retrieval_index(user_id, agent_name)
+                if retrieval is None:
+                    logger.debug("FTS5 search: ensure returned None, skipping (user=%r)", user_id)
+                    return []
+                results = retrieval.search(
+                    query,
+                    scope_user=user_id,
+                    scope_agent=agent_name,
+                    category=category,
+                    top_k=top_k,
+                )
             elapsed_ms = (time.perf_counter() - _t0) * 1000
 
             def _safe_float(c: object, prec: int) -> str:
@@ -377,9 +402,7 @@ class DeerMem(MemoryManager):
         user_id: str | None = None,
         agent_name: str | None = None,
     ) -> dict[str, Any]:
-        result = self._updater.clear_memory_data(agent_name=agent_name, user_id=user_id)
-        self._retrieval_dirty = True
-        return result
+        return self._updater.clear_memory_data(agent_name=agent_name, user_id=user_id)
 
     def import_memory(
         self,
@@ -388,9 +411,7 @@ class DeerMem(MemoryManager):
         user_id: str | None = None,
         agent_name: str | None = None,
     ) -> dict[str, Any]:
-        result = self._updater.import_memory_data(memory_data, agent_name=agent_name, user_id=user_id)
-        self._retrieval_dirty = True
-        return result
+        return self._updater.import_memory_data(memory_data, agent_name=agent_name, user_id=user_id)
 
     def export_memory(
         self,
@@ -437,9 +458,7 @@ class DeerMem(MemoryManager):
         agent_name: str | None = None,
     ) -> dict[str, Any]:
         """Drop the cached memory document and reload from disk."""
-        result = self._updater.reload_memory_data(agent_name=agent_name, user_id=user_id)
-        self._retrieval_dirty = True
-        return result
+        return self._updater.reload_memory_data(agent_name=agent_name, user_id=user_id)
 
     def create_fact(
         self,
@@ -450,15 +469,13 @@ class DeerMem(MemoryManager):
         agent_name: str | None = None,
         user_id: str | None = None,
     ) -> tuple[dict[str, Any], str | None]:
-        result = self._updater.create_memory_fact(
+        return self._updater.create_memory_fact(
             content,
             category=category,
             confidence=confidence,
             agent_name=agent_name,
             user_id=user_id,
         )
-        self._retrieval_dirty = True
-        return result
 
     def delete_fact(
         self,
@@ -467,9 +484,7 @@ class DeerMem(MemoryManager):
         agent_name: str | None = None,
         user_id: str | None = None,
     ) -> dict[str, Any]:
-        result = self._updater.delete_memory_fact(fact_id, agent_name=agent_name, user_id=user_id)
-        self._retrieval_dirty = True
-        return result
+        return self._updater.delete_memory_fact(fact_id, agent_name=agent_name, user_id=user_id)
 
     def update_fact(
         self,
@@ -481,7 +496,7 @@ class DeerMem(MemoryManager):
         agent_name: str | None = None,
         user_id: str | None = None,
     ) -> dict[str, Any]:
-        result = self._updater.update_memory_fact(
+        return self._updater.update_memory_fact(
             fact_id,
             content=content,
             category=category,
@@ -489,5 +504,3 @@ class DeerMem(MemoryManager):
             agent_name=agent_name,
             user_id=user_id,
         )
-        self._retrieval_dirty = True
-        return result

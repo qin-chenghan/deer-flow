@@ -796,6 +796,8 @@ Across sessions, DeerFlow builds a persistent memory of your profile, preference
 
 Memory updates now skip duplicate fact entries at apply time, so repeated preferences and context do not accumulate endlessly across sessions.
 
+Memory search uses a per-user SQLite FTS5 index with jieba tokenization for Chinese text, BM25 relevance ranking, and a substring fallback for queries that cannot be parsed as full-text search. Index snapshots refresh when the background memory updater writes new facts, while search results preserve the original fact content and source metadata.
+
 ## Recommended Models
 
 DeerFlow is model-agnostic — it works with any LLM that implements the OpenAI-compatible API. That said, it performs best with models that support:
