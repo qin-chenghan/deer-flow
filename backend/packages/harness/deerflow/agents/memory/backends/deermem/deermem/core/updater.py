@@ -607,6 +607,21 @@ class MemoryUpdater:
 
     def import_memory_data(self, memory_data: dict[str, Any], agent_name: str | None = None, *, user_id: str | None = None) -> dict[str, Any]:
         """Persist imported memory data via the injected storage."""
+        if not isinstance(memory_data, dict):
+            raise ValueError("memory_data")
+        memory_data = copy.deepcopy(memory_data)
+        empty = create_empty_memory()
+        for section in ("user", "history"):
+            incoming_section = memory_data.get(section, {})
+            if not isinstance(incoming_section, dict):
+                raise ValueError(f"memory_data.{section}")
+            complete_section = copy.deepcopy(empty[section])
+            for key, value in incoming_section.items():
+                if key in complete_section and isinstance(complete_section[key], dict) and isinstance(value, dict):
+                    complete_section[key].update(copy.deepcopy(value))
+                else:
+                    complete_section[key] = copy.deepcopy(value)
+            memory_data[section] = complete_section
         if agent_name is not None and getattr(type(self._storage), "apply_changes", None) is not MemoryStorage.apply_changes:
             current = self.get_memory_data(agent_name, user_id=user_id)
             incoming_facts = copy.deepcopy(memory_data.get("facts", []))
@@ -631,7 +646,6 @@ class MemoryUpdater:
             )
             return self._storage.load(agent_name, user_id=user_id)
         if agent_name is None:
-            memory_data = copy.deepcopy(memory_data)
             memory_data["facts"] = []
         if not self._storage.save(memory_data, agent_name, user_id=user_id):
             raise OSError("Failed to save imported memory data")

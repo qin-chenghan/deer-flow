@@ -74,6 +74,52 @@ def test_zero_config_defaults_run_non_llm_ops(deermem_data_dir):
     assert dm.get_memory(user_id="u")["facts"][0]["content"] == "x"
 
 
+def test_import_without_agent_name_persists_facts_in_default_markdown_bucket(deermem_data_dir):
+    dm = DeerMem(backend_config=None)
+    dm.import_memory(
+        {
+            "user": {},
+            "history": {},
+            "facts": [
+                {
+                    "id": "fact_default_import",
+                    "content": "imported through the default manager scope",
+                    "category": "context",
+                    "confidence": 0.8,
+                    "source": "import",
+                }
+            ],
+        },
+        user_id="alice",
+    )
+
+    assert [fact["id"] for fact in dm.get_memory(user_id="alice")["facts"]] == ["fact_default_import"]
+    facts_root = deermem_data_dir / "users" / "alice" / "agents" / "__default__" / "facts"
+    assert [path.stem for path in facts_root.glob("**/*.md")] == ["fact_default_import"]
+
+
+def test_import_empty_summary_sections_replace_existing_summaries_with_complete_defaults(deermem_data_dir):
+    dm = DeerMem(backend_config=None)
+    existing = dm.get_memory(user_id="alice")
+    existing["user"]["workContext"] = {"summary": "old work", "updatedAt": "old"}
+    existing["user"]["personalContext"] = {"summary": "old personal", "updatedAt": "old"}
+    existing["history"]["recentMonths"] = {"summary": "old history", "updatedAt": "old"}
+    dm.import_memory(existing, user_id="alice")
+
+    imported = dm.import_memory({"user": {}, "history": {}, "facts": []}, user_id="alice")
+
+    assert imported["user"] == {
+        "workContext": {"summary": "", "updatedAt": ""},
+        "personalContext": {"summary": "", "updatedAt": ""},
+        "topOfMind": {"summary": "", "updatedAt": ""},
+    }
+    assert imported["history"] == {
+        "recentMonths": {"summary": "", "updatedAt": ""},
+        "earlierContext": {"summary": "", "updatedAt": ""},
+        "longTermBackground": {"summary": "", "updatedAt": ""},
+    }
+
+
 def test_trace_id_threads_through_to_tracing_callback(deermem_data_dir):
     calls = []
 

@@ -69,6 +69,10 @@ class RetrievalPort(Protocol):
     def search(self, query: str, *, scopes: list[dict[str, str | None]], top_k: int, mode: str, filters: dict[str, Any] | None) -> list[dict[str, Any]]: ...
 
 
+RetrievalNotification = tuple[str, dict[str, Any] | str, str | None]
+ScopedRetrievalNotifications = tuple[str, list[RetrievalNotification]]
+
+
 def utc_now_iso_z() -> str:
     return datetime.now(UTC).isoformat().removesuffix("+00:00") + "Z"
 
@@ -440,6 +444,26 @@ class FileMemoryStorage(MemoryStorage):
         revision = int((memory_file or {}).get("revision") or 0)
         return (*file_signature, revision)
 
+    def _dispatch_retrieval_notifications(
+        self,
+        notifications: list[RetrievalNotification],
+        *,
+        user_id: str | None,
+        agent_name: str | None,
+    ) -> None:
+        """Notify the optional index only after durable storage locks are released."""
+        if self._retrieval is None:
+            return
+        scope = _scope_dict(user_id, agent_name)
+        for action, value, fact_path in notifications:
+            try:
+                if action == "upsert":
+                    self._retrieval.upsert(copy.deepcopy(value), scope=scope, path=fact_path or "")
+                else:
+                    self._retrieval.remove(str(value), scope=scope)
+            except Exception:
+                logger.exception("Retrieval notification failed for %s", value)
+
     @staticmethod
     def _validate_loaded_fact(
         fact: dict[str, Any],
@@ -498,7 +522,12 @@ class FileMemoryStorage(MemoryStorage):
         memory_file = self._load_memory_file(path)
         return memory_file is not None and ("facts" in memory_file or memory_file.get("version") != DOCUMENT_VERSION)
 
-    def _migrate_previous_default_bucket_locked(self, path: Path, *, user_id: str | None) -> bool:
+    def _migrate_previous_default_bucket_locked(
+        self,
+        path: Path,
+        *,
+        user_id: str | None,
+    ) -> tuple[bool, list[RetrievalNotification]]:
         """Move facts written by the earlier ``lead-agent`` default mapping.
 
         A real custom ``lead-agent`` owns a ``config.yaml`` and is never
@@ -508,7 +537,7 @@ class FileMemoryStorage(MemoryStorage):
         legacy_agent_name = "lead-agent"
         legacy_agent_dir = path.parent / "agents" / legacy_agent_name
         if not legacy_agent_dir.exists() or (legacy_agent_dir / "config.yaml").is_file():
-            return False
+            return False, []
         unexpected = [child for child in legacy_agent_dir.iterdir() if child.name != "facts"]
         legacy_facts_dir = legacy_agent_dir / "facts"
         if legacy_facts_dir.exists():
@@ -534,7 +563,7 @@ class FileMemoryStorage(MemoryStorage):
             upserts.append(candidate)
 
         current_memory = self._load_memory_file(path)
-        self._commit_changes_locked(
+        _, notifications = self._commit_changes_locked(
             path,
             user_id=user_id,
             agent_name=DEFAULT_AGENT_BUCKET,
@@ -562,7 +591,7 @@ class FileMemoryStorage(MemoryStorage):
             legacy_agent_dir.rmdir()
         except OSError:
             pass
-        return True
+        return True, notifications
 
     def _run_read_migrations_locked(
         self,
@@ -570,22 +599,30 @@ class FileMemoryStorage(MemoryStorage):
         agent_name: str | None,
         *,
         user_id: str | None,
-    ) -> None:
+    ) -> list[ScopedRetrievalNotifications]:
         """Finish journal recovery and all migrations reachable from reads."""
+        notifications_by_agent: list[ScopedRetrievalNotifications] = []
         self._recover_if_needed(path)
         if self._global_json_needs_migration(path):
-            self._migrate_locked(
+            _, _, notifications = self._migrate_locked(
                 path,
                 DEFAULT_AGENT_BUCKET,
                 user_id=user_id,
                 include_global=True,
             )
+            if notifications:
+                notifications_by_agent.append((DEFAULT_AGENT_BUCKET, notifications))
         if agent_name is not None:
             legacy_path = self._legacy_agent_memory_path(path, agent_name)
             if legacy_path.exists():
-                self._migrate_locked(path, agent_name, user_id=user_id, include_global=False)
+                _, _, notifications = self._migrate_locked(path, agent_name, user_id=user_id, include_global=False)
+                if notifications:
+                    notifications_by_agent.append((agent_name, notifications))
         if agent_name == DEFAULT_AGENT_BUCKET:
-            self._migrate_previous_default_bucket_locked(path, user_id=user_id)
+            _, notifications = self._migrate_previous_default_bucket_locked(path, user_id=user_id)
+            if notifications:
+                notifications_by_agent.append((DEFAULT_AGENT_BUCKET, notifications))
+        return notifications_by_agent
 
     @staticmethod
     def _migration_equivalent(left: dict[str, Any], right: dict[str, Any]) -> bool:
@@ -663,7 +700,7 @@ class FileMemoryStorage(MemoryStorage):
         expected_revision: int | None,
         delete_revisions: dict[str, int] | None = None,
         upsert_revisions: dict[str, int | None] | None = None,
-    ) -> tuple[dict[str, Any], list[tuple[str, dict[str, Any] | str, str | None]]]:
+    ) -> tuple[dict[str, Any], list[RetrievalNotification]]:
         """Commit only the addressed fact files plus the shared summary JSON.
 
         Callers hold both locks and have already run journal recovery.  This is
@@ -725,9 +762,13 @@ class FileMemoryStorage(MemoryStorage):
             if not isinstance(summaries, dict):
                 raise ValueError("change_set.summaries must be an object")
             if "user" in summaries:
-                user_section = copy.deepcopy(summaries["user"])
+                if not isinstance(summaries["user"], dict):
+                    raise ValueError("change_set.summaries.user must be an object")
+                user_section.update(copy.deepcopy(summaries["user"]))
             if "history" in summaries:
-                history_section = copy.deepcopy(summaries["history"])
+                if not isinstance(summaries["history"], dict):
+                    raise ValueError("change_set.summaries.history must be an object")
+                history_section.update(copy.deepcopy(summaries["history"]))
         summaries_changed = user_section != base.get("user", {}) or history_section != base.get("history", {})
         needs_manifest_cleanup = current_memory is None or current_memory.get("version") != DOCUMENT_VERSION or "facts" in current_memory
         if not prepared and not removals and not summaries_changed and not needs_manifest_cleanup:
@@ -768,7 +809,7 @@ class FileMemoryStorage(MemoryStorage):
                 shutil.copy2(old_path, recovery_dir / f"{fact_id}.md")
         _atomic_write(journal_path, json.dumps(journal, ensure_ascii=False, indent=2).encode("utf-8"))
 
-        notifications: list[tuple[str, dict[str, Any] | str, str | None]] = []
+        notifications: list[RetrievalNotification] = []
         for fact_id, (fact, _, fact_path) in prepared.items():
             _atomic_write(fact_path, _render_fact_markdown(fact))
             notifications.append(("upsert", fact, str(fact_path)))
@@ -793,7 +834,15 @@ class FileMemoryStorage(MemoryStorage):
                 self._memory_cache.pop(cache_key, None)
         return memory_file, notifications
 
-    def _migrate_locked(self, path: Path, agent_name: str, *, user_id: str | None, include_global: bool) -> tuple[bool, str | None]:
+    def _migrate_locked(
+        self,
+        path: Path,
+        agent_name: str,
+        *,
+        user_id: str | None,
+        include_global: bool,
+        adopt_legacy_summaries: bool = True,
+    ) -> tuple[bool, str | None, list[RetrievalNotification]]:
         """Merge legacy facts without overwriting an existing canonical fact."""
         sources: list[tuple[Path, dict[str, Any]]] = []
         legacy_path = self._legacy_agent_memory_path(path, agent_name)
@@ -805,14 +854,14 @@ class FileMemoryStorage(MemoryStorage):
         if include_global and global_memory is not None and ("facts" in global_memory or global_memory.get("version") != DOCUMENT_VERSION):
             sources.append((path, global_memory))
         if not sources:
-            return False, from_version
+            return False, from_version, []
 
         base = global_memory or create_empty_memory()
         migrated_summaries = {
             "user": copy.deepcopy(base.get("user", {})),
             "history": copy.deepcopy(base.get("history", {})),
         }
-        if legacy_memory is not None:
+        if legacy_memory is not None and adopt_legacy_summaries:
             for section in ("user", "history"):
                 migrated_summaries[section] = _merge_legacy_summary_section(
                     canonical=migrated_summaries[section],
@@ -855,7 +904,7 @@ class FileMemoryStorage(MemoryStorage):
             _ensure_migration_backup(source_path)
 
         current_revision = int((global_memory or {}).get("revision") or 0)
-        self._commit_changes_locked(
+        _, notifications = self._commit_changes_locked(
             path,
             user_id=user_id,
             agent_name=agent_name,
@@ -866,7 +915,7 @@ class FileMemoryStorage(MemoryStorage):
         )
         if legacy_memory is not None:
             legacy_path.unlink(missing_ok=True)
-        return True, from_version
+        return True, from_version, notifications
 
     def _document_from_memory_file(
         self,
@@ -926,9 +975,12 @@ class FileMemoryStorage(MemoryStorage):
             or self._global_json_needs_migration(path)
             or (agent_name == DEFAULT_AGENT_BUCKET and previous_default_dir.exists() and not (previous_default_dir / "config.yaml").is_file())
         )
+        migration_notifications: list[ScopedRetrievalNotifications] = []
         if needs_migration:
             with self._scope_lock(key), _process_file_lock(path.parent / ".memory.lock", float(getattr(self._config, "file_lock_timeout_seconds", 10))):
-                self._run_read_migrations_locked(path, agent_name, user_id=user_id)
+                migration_notifications = self._run_read_migrations_locked(path, agent_name, user_id=user_id)
+        for notification_agent, notifications in migration_notifications:
+            self._dispatch_retrieval_notifications(notifications, user_id=user_id, agent_name=notification_agent)
         signature = self._scope_signature(path, agent_name)
         with self._cache_lock:
             cached = self._memory_cache.get(key)
@@ -950,9 +1002,12 @@ class FileMemoryStorage(MemoryStorage):
             or self._global_json_needs_migration(path)
             or (agent_name == DEFAULT_AGENT_BUCKET and previous_default_dir.exists() and not (previous_default_dir / "config.yaml").is_file())
         )
+        migration_notifications: list[ScopedRetrievalNotifications] = []
         if needs_migration:
             with self._scope_lock(key), _process_file_lock(path.parent / ".memory.lock", float(getattr(self._config, "file_lock_timeout_seconds", 10))):
-                self._run_read_migrations_locked(path, agent_name, user_id=user_id)
+                migration_notifications = self._run_read_migrations_locked(path, agent_name, user_id=user_id)
+        for notification_agent, notifications in migration_notifications:
+            self._dispatch_retrieval_notifications(notifications, user_id=user_id, agent_name=notification_agent)
         document = self._read_document(path, agent_name, user_id=user_id)
         signature = self._scope_signature(path, agent_name)
         with self._cache_lock:
@@ -972,7 +1027,8 @@ class FileMemoryStorage(MemoryStorage):
         key = self._cache_key(agent_name, user_id=user_id)
         with self._scope_lock(key), _process_file_lock(path.parent / ".memory.lock", float(getattr(self._config, "file_lock_timeout_seconds", 10))):
             self._recover_if_needed(path)
-            migrated, from_version = self._migrate_locked(path, agent_name, user_id=user_id, include_global=True)
+            migrated, from_version, notifications = self._migrate_locked(path, agent_name, user_id=user_id, include_global=True)
+        self._dispatch_retrieval_notifications(notifications, user_id=user_id, agent_name=agent_name)
         document = self.reload(agent_name, user_id=user_id)
         return {
             "migrated": migrated,
@@ -999,7 +1055,7 @@ class FileMemoryStorage(MemoryStorage):
         path = self._get_memory_file_path(agent_name, user_id=user_id)
         key = self._cache_key(agent_name, user_id=user_id)
         lock_path = path.parent / ".memory.lock"
-        notifications: list[tuple[str, dict[str, Any] | str, str | None]] = []
+        notifications: list[RetrievalNotification] = []
         try:
             if not isinstance(memory_data, dict):
                 raise ValueError("memory_data must be an object")
@@ -1040,23 +1096,14 @@ class FileMemoryStorage(MemoryStorage):
             logger.error("Failed to save memory scope %s: %s", key, exc)
             return False
 
-        if self._retrieval is not None:
-            scope = _scope_dict(user_id, agent_name)
-            for action, value, fact_path in notifications:
-                try:
-                    if action == "upsert":
-                        self._retrieval.upsert(value, scope=scope, path=fact_path or "")
-                    else:
-                        self._retrieval.remove(str(value), scope=scope)
-                except Exception:
-                    logger.exception("Retrieval notification failed for %s", value)
+        self._dispatch_retrieval_notifications(notifications, user_id=user_id, agent_name=agent_name)
         return True
 
     def clear_all(self, *, user_id: str | None = None) -> dict[str, Any]:
         """Clear one user's summaries and all agent facts, preserving agent configs."""
         path = self._get_memory_file_path(user_id=user_id)
         key = self._cache_key(user_id=user_id)
-        notifications_by_agent: list[tuple[str, list[tuple[str, dict[str, Any] | str, str | None]]]] = []
+        notifications_by_agent: list[ScopedRetrievalNotifications] = []
         with (
             self._scope_lock(key),
             _process_file_lock(
@@ -1070,6 +1117,17 @@ class FileMemoryStorage(MemoryStorage):
                 for agent_dir in sorted(child for child in agents_root.iterdir() if child.is_dir()):
                     agent_name = agent_dir.name
                     validate_agent_name(agent_name)
+                    legacy_path = self._legacy_agent_memory_path(path, agent_name)
+                    if legacy_path.exists():
+                        _, _, migration_notifications = self._migrate_locked(
+                            path,
+                            agent_name,
+                            user_id=user_id,
+                            include_global=False,
+                            adopt_legacy_summaries=False,
+                        )
+                        if migration_notifications:
+                            notifications_by_agent.append((agent_name, migration_notifications))
                     facts = self._load_agent_facts(path, agent_name, user_id=user_id)
                     if not facts:
                         continue
@@ -1098,16 +1156,8 @@ class FileMemoryStorage(MemoryStorage):
                 expected_revision=int((current_memory or {}).get("revision") or 0),
             )
 
-        if self._retrieval is not None:
-            for agent_name, notifications in notifications_by_agent:
-                scope = _scope_dict(user_id, agent_name)
-                for action, value, _ in notifications:
-                    if action != "remove":
-                        continue
-                    try:
-                        self._retrieval.remove(str(value), scope=scope)
-                    except Exception:
-                        logger.exception("Retrieval notification failed for %s", value)
+        for agent_name, notifications in notifications_by_agent:
+            self._dispatch_retrieval_notifications(notifications, user_id=user_id, agent_name=agent_name)
         return self.reload(DEFAULT_AGENT_BUCKET, user_id=user_id)
 
     @staticmethod
@@ -1131,11 +1181,13 @@ class FileMemoryStorage(MemoryStorage):
         path = self._get_memory_file_path(agent_name, user_id=user_id)
         key = self._cache_key(agent_name, user_id=user_id)
         legacy_path = self._legacy_agent_memory_path(path, agent_name)
+        notifications: list[RetrievalNotification] = []
         with self._scope_lock(key), _process_file_lock(path.parent / ".memory.lock", float(getattr(self._config, "file_lock_timeout_seconds", 10))):
             self._recover_if_needed(path)
             if legacy_path.exists():
-                self._migrate_locked(path, agent_name, user_id=user_id, include_global=False)
+                _, _, notifications = self._migrate_locked(path, agent_name, user_id=user_id, include_global=False)
             fact, _ = self._read_fact(path, fact_id, user_id=user_id, agent_name=agent_name)
+        self._dispatch_retrieval_notifications(notifications, user_id=user_id, agent_name=agent_name)
         return copy.deepcopy(fact)
 
     def list_facts(
@@ -1202,7 +1254,7 @@ class FileMemoryStorage(MemoryStorage):
         path = self._get_memory_file_path(agent_name, user_id=user_id)
         key = self._cache_key(agent_name, user_id=user_id)
         expected = expected_manifest_revision
-        notifications: list[tuple[str, dict[str, Any] | str, str | None]] = []
+        notifications: list[RetrievalNotification] = []
         memory_file: dict[str, Any] | None = None
         safe_delete_rebase = not deletes or (isinstance(delete_revisions, dict) and all(str(fact_id) in delete_revisions for fact_id in deletes))
         safe_upsert_rebase = all(str(incoming["id"]) in normalized_upsert_revisions for incoming in upserts)
@@ -1229,16 +1281,7 @@ class FileMemoryStorage(MemoryStorage):
                 current = self._load_memory_file(path)
                 expected = int((current or {}).get("revision") or 0)
                 logger.info("Rebasing disjoint memory fact change after revision conflict: %s", exc)
-        if self._retrieval is not None:
-            scope = _scope_dict(user_id, agent_name)
-            for action, value, fact_path in notifications:
-                try:
-                    if action == "upsert":
-                        self._retrieval.upsert(copy.deepcopy(value), scope=scope, path=fact_path or "")
-                    else:
-                        self._retrieval.remove(str(value), scope=scope)
-                except Exception:
-                    logger.exception("Retrieval notification failed for %s", value)
+        self._dispatch_retrieval_notifications(notifications, user_id=user_id, agent_name=agent_name)
         if memory_file is None:  # defensive: the bounded loop either commits or raises
             raise MemoryStorageError("Memory repository change did not produce a result")
         return {

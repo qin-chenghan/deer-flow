@@ -140,7 +140,7 @@ clear_memory(user_id=alice, agent_name=research-agent)
     preserves shared user/history summaries
 ```
 
-The file backend's all-user clear holds the user lock while enumerating and deleting canonical fact files.
+The file backend's all-user clear holds the user lock while enumerating buckets. It first migrates facts from any unread legacy per-agent `memory.json` without adopting legacy summaries that are about to be cleared, then deletes the resulting canonical fact files; retained `.v1.bak` files are inactive migration evidence and are never read back, while custom-agent configuration remains untouched.
 
 ## 8. Source compatibility
 
@@ -182,8 +182,11 @@ first load/reload
   -> normalize facts into __default__ scope
   -> commit Markdown files and preserved summaries through the journal
   -> rewrite memory.json without facts
+  -> release storage locks and notify the configured retrieval adapter
   -> continue the original read
 ```
+
+The explicit CLI path emits the same retrieval upserts. Re-running an idempotent migration emits no duplicate notification because no fact is rewritten.
 
 Operators may run:
 

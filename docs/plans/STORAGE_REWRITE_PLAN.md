@@ -167,6 +167,8 @@ On conflict they:
 
 This preserves Clear All/scoped-clear meaning and the `max_facts` invariant.
 
+Summary change sets are patches at the `user`/`history` child-key level: omitted siblings remain persisted. Import remains replacement-oriented by normalizing incoming sections against the complete empty compatibility schema before it calls storage.
+
 ## 9. Cache model
 
 Every supported fact mutation advances and atomically replaces the shared `memory.json`. Cache validation uses `(mtime_ns, file_size, revision)` from that file. The persisted revision prevents a stale hit when a coarse-mtime filesystem reports identical metadata for same-size writes.
@@ -177,7 +179,9 @@ Inactive per-scope locks are weakly cached and may be garbage-collected.
 
 ## 10. Migration
 
-The first normal default read detects legacy facts in `memory.json`, acquires the normal locks, and migrates them into `__default__`. User/history summaries are preserved and the JSON is rewritten without `facts`.
+The first normal default read detects legacy facts in `memory.json`, acquires the normal locks, and migrates them into `__default__`. User/history summaries are preserved and the JSON is rewritten without `facts`. Explicit and lazy migrations return their committed fact deltas through the call chain and notify a configured retrieval adapter after releasing storage locks.
+
+Clear All enumerates every agent while holding the user lock. Facts from any unread legacy per-agent JSON are migrated first without adopting legacy summaries that are about to be cleared, and the resulting canonical facts are then deleted with the rest of the bucket. This prevents both summary conflicts from blocking an explicit clear and a later read from resurrecting skipped facts. The immutable `.v1.bak` remains inactive and agent configuration files remain untouched.
 
 The v1-to-v2 migration is one-way for the running application because pre-PR code does not read Markdown facts. Operators must stop DeerFlow and create a filesystem snapshot or full backup of the configured storage root before upgrading a persistent deployment. Before the first destructive v2 write, storage atomically and durably retains every migrated JSON source as `{source_filename}.v1.bak`. An existing backup is never overwritten: if it differs from the source, or if the backup cannot be written, migration stops before changing v1 data. These local backups preserve pre-migration data only and do not replace the required full snapshot.
 

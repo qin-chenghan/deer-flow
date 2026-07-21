@@ -213,6 +213,25 @@ def test_manifest_revision_conflict_rejects_stale_write(storage: FileMemoryStora
         storage.save(_memory_with_fact("stale"), "agent-a", user_id="alice", expected_revision=1)
 
 
+def test_partial_summary_patch_preserves_omitted_sibling_sections(storage: FileMemoryStorage) -> None:
+    memory = create_empty_memory()
+    memory["user"]["workContext"] = {"summary": "old work", "updatedAt": "old"}
+    memory["user"]["personalContext"] = {"summary": "keep personal", "updatedAt": "old"}
+    memory["user"]["topOfMind"] = {"summary": "keep focus", "updatedAt": "old"}
+    assert storage.save(memory, user_id="alice")
+
+    storage.apply_changes(
+        {"summaries": {"user": {"workContext": {"summary": "new work", "updatedAt": "new"}}}},
+        user_id="alice",
+        expected_manifest_revision=1,
+    )
+
+    updated = storage.load(user_id="alice")
+    assert updated["user"]["workContext"] == {"summary": "new work", "updatedAt": "new"}
+    assert updated["user"]["personalContext"] == {"summary": "keep personal", "updatedAt": "old"}
+    assert updated["user"]["topOfMind"] == {"summary": "keep focus", "updatedAt": "old"}
+
+
 def test_storage_delegates_index_lifecycle_and_search_to_retrieval(tmp_path: Path) -> None:
     class FakeRetrieval:
         def __init__(self) -> None:
@@ -391,6 +410,33 @@ def test_explicit_migrate_converts_legacy_json(storage: FileMemoryStorage) -> No
     assert path.with_name("memory.json.v1.bak").read_bytes() == original
 
 
+def test_explicit_migration_notifies_retrieval_adapter(tmp_path: Path) -> None:
+    class RecordingRetrieval:
+        def __init__(self) -> None:
+            self.upserts: list[tuple[str, dict, str]] = []
+
+        def upsert(self, fact, *, scope, path):
+            self.upserts.append((fact["id"], scope, path))
+
+        def remove(self, fact_id, *, scope):
+            pass
+
+        def search(self, query, *, scopes, top_k, mode, filters):
+            return []
+
+    retrieval = RecordingRetrieval()
+    scoped = FileMemoryStorage(DeerMemConfig(storage_path=str(tmp_path)), retrieval=retrieval)
+    path = scoped._get_memory_file_path(user_id="alice")
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(_memory_with_fact("legacy indexed fact")), encoding="utf-8")
+
+    scoped.migrate(user_id="alice", agent_name="agent-a")
+    scoped.migrate(user_id="alice", agent_name="agent-a")
+
+    assert [(fact_id, scope) for fact_id, scope, _ in retrieval.upserts] == [("fact_01HZZZZZZZZZZZZZZZZZZZZZZZ", {"userId": "alice", "agentName": "agent-a"})]
+    assert retrieval.upserts[0][2].endswith("fact_01HZZZZZZZZZZZZZZZZZZZZZZZ.md")
+
+
 def test_first_agent_load_removes_legacy_per_agent_memory_json(storage: FileMemoryStorage) -> None:
     user_memory_path = storage._get_memory_file_path("agent-a", user_id="alice")
     legacy_path = user_memory_path.parent / "agents" / "agent-a" / "memory.json"
@@ -405,6 +451,82 @@ def test_first_agent_load_removes_legacy_per_agent_memory_json(storage: FileMemo
     assert legacy_path.with_name("memory.json.v1.bak").read_bytes() == original
     assert user_memory_path.exists()
     assert "facts" not in json.loads(user_memory_path.read_text(encoding="utf-8"))
+
+
+def test_lazy_agent_migration_notifies_retrieval_adapter(tmp_path: Path) -> None:
+    class RecordingRetrieval:
+        def __init__(self) -> None:
+            self.upserts: list[str] = []
+
+        def upsert(self, fact, *, scope, path):
+            self.upserts.append(fact["id"])
+
+        def remove(self, fact_id, *, scope):
+            pass
+
+        def search(self, query, *, scopes, top_k, mode, filters):
+            return []
+
+    retrieval = RecordingRetrieval()
+    scoped = FileMemoryStorage(DeerMemConfig(storage_path=str(tmp_path)), retrieval=retrieval)
+    memory_path = scoped._get_memory_file_path("agent-a", user_id="alice")
+    legacy_path = memory_path.parent / "agents" / "agent-a" / "memory.json"
+    legacy_path.parent.mkdir(parents=True)
+    legacy_path.write_text(json.dumps(_memory_with_fact("lazy indexed fact")), encoding="utf-8")
+
+    assert scoped.load("agent-a", user_id="alice")["facts"][0]["content"] == "lazy indexed fact"
+    assert retrieval.upserts == ["fact_01HZZZZZZZZZZZZZZZZZZZZZZZ"]
+
+
+def test_clear_all_migrates_and_then_removes_unread_legacy_agent_facts(storage: FileMemoryStorage) -> None:
+    global_memory = create_empty_memory()
+    global_memory["user"]["workContext"] = {"summary": "canonical summary", "updatedAt": "now"}
+    assert storage.save(global_memory, user_id="alice")
+    memory_path = storage._get_memory_file_path("agent-a", user_id="alice")
+    legacy_path = memory_path.parent / "agents" / "agent-a" / "memory.json"
+    legacy_path.parent.mkdir(parents=True)
+    legacy = _memory_with_fact("legacy fact must stay cleared")
+    legacy["user"]["workContext"] = {"summary": "conflicting legacy summary", "updatedAt": "then"}
+    legacy_path.write_text(json.dumps(legacy), encoding="utf-8")
+    config_path = legacy_path.parent / "config.yaml"
+    config_path.write_text("name: agent-a\n", encoding="utf-8")
+
+    cleared = storage.clear_all(user_id="alice")
+
+    assert cleared["facts"] == []
+    assert not legacy_path.exists()
+    assert legacy_path.with_name("memory.json.v1.bak").exists()
+    assert storage.load("agent-a", user_id="alice")["facts"] == []
+    assert config_path.read_text(encoding="utf-8") == "name: agent-a\n"
+
+
+def test_clear_all_legacy_migration_leaves_retrieval_fact_removed(tmp_path: Path) -> None:
+    class RecordingRetrieval:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, str]] = []
+
+        def upsert(self, fact, *, scope, path):
+            self.events.append(("upsert", fact["id"]))
+
+        def remove(self, fact_id, *, scope):
+            self.events.append(("remove", fact_id))
+
+        def search(self, query, *, scopes, top_k, mode, filters):
+            return []
+
+    retrieval = RecordingRetrieval()
+    scoped = FileMemoryStorage(DeerMemConfig(storage_path=str(tmp_path)), retrieval=retrieval)
+    memory_path = scoped._get_memory_file_path("agent-a", user_id="alice")
+    legacy_path = memory_path.parent / "agents" / "agent-a" / "memory.json"
+    legacy_path.parent.mkdir(parents=True)
+    legacy_path.write_text(json.dumps(_memory_with_fact("legacy indexed then cleared")), encoding="utf-8")
+
+    scoped.clear_all(user_id="alice")
+
+    assert retrieval.events == [
+        ("upsert", "fact_01HZZZZZZZZZZZZZZZZZZZZZZZ"),
+        ("remove", "fact_01HZZZZZZZZZZZZZZZZZZZZZZZ"),
+    ]
 
 
 def test_migration_rejects_a_different_existing_v1_backup(storage: FileMemoryStorage) -> None:

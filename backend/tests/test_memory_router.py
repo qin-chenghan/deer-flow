@@ -89,6 +89,36 @@ def test_import_memory_route_returns_imported_memory() -> None:
     assert response.json()["facts"] == imported_memory["facts"]
 
 
+def test_import_route_without_agent_name_persists_default_bucket_markdown(tmp_path) -> None:
+    app = FastAPI()
+    app.include_router(memory.router)
+    manager = DeerMem(backend_config={"storage_path": str(tmp_path)})
+    imported_memory = _sample_memory(
+        facts=[
+            {
+                "id": "fact_gateway_import",
+                "content": "Gateway imports use the default agent bucket.",
+                "category": "context",
+                "confidence": 0.9,
+                "createdAt": "2026-07-21T00:00:00Z",
+                "source": "import",
+            }
+        ]
+    )
+
+    with (
+        patch("app.gateway.routers.memory.get_memory_manager", return_value=manager),
+        patch("app.gateway.routers.memory.get_effective_user_id", return_value="alice"),
+        TestClient(app) as client,
+    ):
+        response = client.post("/api/memory/import", json=imported_memory)
+
+    assert response.status_code == 200
+    assert [fact["id"] for fact in response.json()["facts"]] == ["fact_gateway_import"]
+    facts_root = tmp_path / "users" / "alice" / "agents" / "__default__" / "facts"
+    assert [path.stem for path in facts_root.glob("**/*.md")] == ["fact_gateway_import"]
+
+
 def test_import_memory_route_preserves_source_error() -> None:
     app = FastAPI()
     app.include_router(memory.router)
