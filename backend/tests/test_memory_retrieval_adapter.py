@@ -5,9 +5,16 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import pytest
+
 from deerflow.agents.memory.backends.deermem.deer_mem import DeerMem
 from deerflow.agents.memory.backends.deermem.deermem.config import DeerMemConfig
-from deerflow.agents.memory.backends.deermem.deermem.core.retrieval import FTS5RetrievalAdapter, _is_advanced_query
+from deerflow.agents.memory.backends.deermem.deermem.core.retrieval import (
+    FTS5Retrieval,
+    FTS5RetrievalAdapter,
+    _is_advanced_query,
+    _jieba_available,
+)
 from deerflow.agents.memory.backends.deermem.deermem.core.storage import FileMemoryStorage
 
 
@@ -24,6 +31,35 @@ def _fact(fact_id: str, content: str, *, category: str = "context") -> dict:
 
 def test_natural_language_hyphens_are_not_treated_as_fts5_syntax() -> None:
     assert not _is_advanced_query("real-time co-pilot node -js +python")
+
+
+@pytest.mark.skipif(not _jieba_available, reason="install the optional memory-zh extra")
+def test_chinese_subphrase_search_uses_jieba_tokenization(tmp_path: Path) -> None:
+    adapter = FTS5RetrievalAdapter(tmp_path / "facts.sqlite3")
+    scope = {"userId": "alice", "agentName": "agent-a"}
+    try:
+        adapter.upsert(_fact("zh", "中文检索支持验证"), scope=scope, path="")
+        results = adapter.search("检索", scopes=[scope], top_k=5, mode="fts5", filters=None)
+        assert [item["fact"]["id"] for item in results] == ["zh"]
+    finally:
+        adapter.close()
+
+
+def test_score_time_decay_and_advanced_phrase_query(tmp_path: Path) -> None:
+    engine = FTS5Retrieval(tmp_path / "facts.sqlite3")
+    try:
+        assert engine._compute_final_score(1.0, 0.5, "2026-07-21T00:00:00Z") > engine._compute_final_score(1.0, 0.5, "2020-01-01T00:00:00Z")
+        engine.index_fact("phrase", "alpha beta", scope_user='"alice"', scope_agent='"agent-a"')
+        assert engine.search('"alpha beta"', scope_user='"alice"', scope_agent='"agent-a"')
+    finally:
+        engine.close()
+
+
+def test_warm_retrieval_rebuilds_the_complete_index(tmp_path: Path) -> None:
+    manager = DeerMem(backend_config={"storage_path": str(tmp_path), "token_counting": "char"})
+    _, fact_id = manager.create_fact("warm retrieval fact", user_id="alice")
+    assert manager.warm_retrieval()
+    assert any(fact["id"] == fact_id for fact in manager.search("warm", user_id="alice"))
 
 
 def test_adapter_isolates_scopes_even_when_fact_ids_repeat(tmp_path: Path) -> None:

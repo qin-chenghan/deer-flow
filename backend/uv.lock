@@ -784,7 +784,6 @@ dependencies = [
     { name = "email-validator" },
     { name = "fastapi" },
     { name = "httpx" },
-    { name = "jieba" },
     { name = "langgraph-sdk" },
     { name = "lark-oapi" },
     { name = "markdown-to-mrkdwn" },
@@ -800,6 +799,9 @@ dependencies = [
 [package.optional-dependencies]
 browser = [
     { name = "deerflow-harness", extra = ["browser"] },
+]
+memory-zh = [
+    { name = "deerflow-harness", extra = ["memory-zh"] },
 ]
 discord = [
     { name = "discord-py" },
@@ -833,6 +835,7 @@ requires-dist = [
     { name = "bcrypt", specifier = ">=4.0.0" },
     { name = "deerflow-harness", editable = "packages/harness" },
     { name = "deerflow-harness", extras = ["browser"], marker = "extra == 'browser'", editable = "packages/harness" },
+    { name = "deerflow-harness", extras = ["memory-zh"], marker = "extra == 'memory-zh'", editable = "packages/harness" },
     { name = "deerflow-harness", extras = ["monocle"], marker = "extra == 'monocle'", editable = "packages/harness" },
     { name = "deerflow-harness", extras = ["postgres"], marker = "extra == 'postgres'", editable = "packages/harness" },
     { name = "deerflow-harness", extras = ["redis"], marker = "extra == 'redis'", editable = "packages/harness" },
@@ -842,7 +845,6 @@ requires-dist = [
     { name = "email-validator", specifier = ">=2.0.0" },
     { name = "fastapi", specifier = ">=0.115.0" },
     { name = "httpx", specifier = ">=0.28.0" },
-    { name = "jieba", specifier = ">=0.42.1" },
     { name = "langgraph-sdk", specifier = ">=0.1.51" },
     { name = "lark-oapi", specifier = ">=1.4.0" },
     { name = "markdown-to-mrkdwn", specifier = ">=0.3.1" },
@@ -854,7 +856,7 @@ requires-dist = [
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.34.0" },
     { name = "wecom-aibot-python-sdk", specifier = ">=0.1.6" },
 ]
-provides-extras = ["postgres", "redis", "discord", "monocle", "browser"]
+provides-extras = ["postgres", "redis", "discord", "monocle", "browser", "memory-zh"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -919,6 +921,9 @@ boxlite = [
 browser = [
     { name = "playwright" },
 ]
+memory-zh = [
+    { name = "jieba" },
+]
 monocle = [
     { name = "monocle-apptrace" },
 ]
@@ -975,6 +980,7 @@ requires-dist = [
     { name = "langgraph-runtime-inmem", specifier = ">=0.28.0" },
     { name = "langgraph-sdk", specifier = ">=0.1.51" },
     { name = "markdownify", specifier = ">=1.2.2" },
+    { name = "jieba", marker = "extra == 'memory-zh'", specifier = ">=0.42.1" },
     { name = "markitdown", extras = ["all", "xlsx"], specifier = ">=0.0.1a2" },
     { name = "monocle-apptrace", marker = "extra == 'monocle'", specifier = ">=0.8.8" },
     { name = "playwright", marker = "extra == 'browser'", specifier = ">=1.40" },
@@ -990,7 +996,7 @@ requires-dist = [
     { name = "textual", marker = "extra == 'tui'", specifier = ">=0.80" },
     { name = "tiktoken", specifier = ">=0.8.0" },
 ]
-provides-extras = ["tui", "groundroute", "ollama", "postgres", "redis", "pymupdf", "boxlite", "monocle", "browser"]
+provides-extras = ["tui", "groundroute", "ollama", "postgres", "redis", "pymupdf", "boxlite", "monocle", "browser", "memory-zh"]
 
 [[package]]
 name = "defusedxml"

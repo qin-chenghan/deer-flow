@@ -22,7 +22,6 @@ dependencies = [
     "pyjwt>=2.13.0",
     "email-validator>=2.0.0",
     "e2b-code-interpreter>=2.8.1",
-    "jieba>=0.42.1",
 ]
 
 [project.optional-dependencies]
@@ -31,6 +30,7 @@ redis = ["deerflow-harness[redis]"]
 discord = ["discord.py>=2.7.0"]
 monocle = ["deerflow-harness[monocle]"]
 browser = ["deerflow-harness[browser]"]
+memory-zh = ["deerflow-harness[memory-zh]"]
 
 [dependency-groups]
 dev = [
