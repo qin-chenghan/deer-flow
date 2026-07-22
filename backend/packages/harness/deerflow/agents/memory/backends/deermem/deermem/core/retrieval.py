@@ -63,8 +63,6 @@ def _tokenize(text: str) -> list[str]:
 _FTS5_ADVANCED_RE = re.compile(
     r"(\bAND\b|\bOR\b|\bNOT\b|\bNEAR\b"
     r'|"\w.*?"'  # phrase "..."
-    r"|\+\w"  # required +word
-    r"|-\w"  # excluded -word
     r"|\w+\*"  # prefix prefix*
     r"|\(.*?\))"  # group (...)
 )

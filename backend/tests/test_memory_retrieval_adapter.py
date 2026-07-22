@@ -7,7 +7,7 @@ from pathlib import Path
 
 from deerflow.agents.memory.backends.deermem.deer_mem import DeerMem
 from deerflow.agents.memory.backends.deermem.deermem.config import DeerMemConfig
-from deerflow.agents.memory.backends.deermem.deermem.core.retrieval import FTS5RetrievalAdapter
+from deerflow.agents.memory.backends.deermem.deermem.core.retrieval import FTS5RetrievalAdapter, _is_advanced_query
 from deerflow.agents.memory.backends.deermem.deermem.core.storage import FileMemoryStorage
 
 
@@ -20,6 +20,10 @@ def _fact(fact_id: str, content: str, *, category: str = "context") -> dict:
         "createdAt": "2026-07-21T00:00:00Z",
         "source": {"type": "test", "threadId": None},
     }
+
+
+def test_natural_language_hyphens_are_not_treated_as_fts5_syntax() -> None:
+    assert not _is_advanced_query("real-time co-pilot node -js +python")
 
 
 def test_adapter_isolates_scopes_even_when_fact_ids_repeat(tmp_path: Path) -> None:
