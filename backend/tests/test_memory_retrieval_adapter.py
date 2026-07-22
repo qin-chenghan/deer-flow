@@ -71,6 +71,11 @@ def test_lazy_warm_rebuilds_each_requested_scope(tmp_path: Path) -> None:
     assert calls == [[scopes[0]], [scopes[1]]]
 
 
+def test_deermem_close_releases_retrieval_connection(tmp_path: Path) -> None:
+    manager = DeerMem(backend_config={"storage_path": str(tmp_path), "token_counting": "char"})
+    manager.close()
+
+
 def test_adapter_isolates_scopes_even_when_fact_ids_repeat(tmp_path: Path) -> None:
     adapter = FTS5RetrievalAdapter(tmp_path / "facts.sqlite3")
     try:

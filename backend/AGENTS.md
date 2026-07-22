@@ -608,7 +608,7 @@ The cached value is reused for both the blocking (`runs.wait`) and streaming (`_
 - `queue.py` - Debounced update queue (per-thread deduplication, configurable wait time); captures `user_id` at enqueue time so it survives the `threading.Timer` boundary
 - `prompt.py` - Prompt templates for memory updates
 - `storage.py` - File repository with one user-global summary JSON, agent-owned single-fact Markdown, target-only journaled changes, strict fact validation, shared-user plus per-fact optimistic revisions, lock-protected migration, deep-copy caching, and a RetrievalPort adapter boundary
-- `retrieval.py` - Built-in scope-aware SQLite FTS5/BM25 adapter; it stores only rebuildable derived data and can be disabled with an empty `retrieval_adapter`. Chinese jieba tokenization is optional via the backend `memory-zh` extra; without it the adapter uses SQLite unicode tokenization and the substring fallback.
+- `retrieval.py` - Built-in scope-aware SQLite FTS5/BM25 adapter; it stores only rebuildable derived data and can be disabled with an empty `retrieval_adapter`. Chinese jieba tokenization is optional via the backend `memory-zh` extra; without it the adapter uses SQLite unicode tokenization and the substring fallback. The Gateway closes the derived SQLite connection after its shutdown flush; reads and writes remain serialized by the adapter lock, with connection pooling deferred as a performance follow-up.
 - `tools.py` - Tool-driven memory mode (`memory_search`, `memory_add`, `memory_update`, `memory_delete`) using the same storage/update primitives
 
 **Per-User Isolation**:

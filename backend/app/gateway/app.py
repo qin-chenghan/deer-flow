@@ -377,6 +377,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                         "Memory queue flush did not finish within %.1fs; remaining updates may be lost",
                         flush_timeout,
                     )
+                close = getattr(manager, "close", None)
+                if callable(close):
+                    await asyncio.to_thread(close)
         except Exception:
             logger.exception("Failed to flush memory queue on shutdown")
 

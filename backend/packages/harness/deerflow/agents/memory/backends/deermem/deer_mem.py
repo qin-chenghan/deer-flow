@@ -407,6 +407,13 @@ class DeerMem(MemoryManager):
         """
         return self._queue.flush_sync(timeout)
 
+    def close(self) -> None:
+        """Close derived retrieval resources after pending updates drain."""
+        retrieval = getattr(self._storage, "_retrieval", None)
+        close = getattr(retrieval, "close", None)
+        if callable(close):
+            close()
+
     # ── DeerMem-internal (NOT on the ABC; reached via hasattr probing) ───
     def warm(self) -> bool:
         """Pre-warm DeerMem's token-counting resources.
