@@ -273,7 +273,7 @@ class DeerMem(MemoryManager):
         search_facts = getattr(self._storage, "search_facts", None)
         scopes = [{"userId": user_id, "agentName": agent_name}]
         try:
-            self._ensure_retrieval_scope(scopes[0])
+            self._ensure_retrieval_scopes(scopes)
             indexed = (
                 search_facts(
                     query,
@@ -308,8 +308,8 @@ class DeerMem(MemoryManager):
         matched.sort(key=_coerce_source_confidence, reverse=True)
         return _compat_document({"facts": matched[:top_k]})["facts"]
 
-    def _ensure_retrieval_scope(self, scope: dict[str, str | None]) -> None:
-        """Lazily rebuild one scope when host warm-up was not run."""
+    def _ensure_retrieval_scopes(self, scopes: list[dict[str, str | None]]) -> None:
+        """Lazily rebuild every requested scope when warm-up was skipped."""
         if not hasattr(self, "_retrieval_lock"):
             self._retrieval_lock = threading.RLock()
         if not hasattr(self, "_retrieval_warmed_scopes"):
@@ -319,21 +319,24 @@ class DeerMem(MemoryManager):
         rebuild = getattr(self._storage, "rebuild_index", None)
         if not callable(rebuild):
             return
-        key = (scope.get("userId"), scope.get("agentName"))
         with self._retrieval_lock:
-            if self._retrieval_fully_warmed or key in self._retrieval_warmed_scopes:
+            if self._retrieval_fully_warmed:
                 return
             status = getattr(self._storage, "retrieval_status", lambda: {"configured": True})()
             if not status.get("configured", True):
-                self._retrieval_warmed_scopes.add(key)
+                self._retrieval_warmed_scopes.update((scope.get("userId"), scope.get("agentName")) for scope in scopes)
                 return
-            try:
-                result = rebuild([scope])
-            except Exception:
-                logger.exception("Failed to lazily rebuild memory retrieval index for scope %r", key)
-                return
-            if result.get("supported") and not result.get("failed"):
-                self._retrieval_warmed_scopes.add(key)
+            for scope in scopes:
+                key = (scope.get("userId"), scope.get("agentName"))
+                if key in self._retrieval_warmed_scopes:
+                    continue
+                try:
+                    result = rebuild([scope])
+                except Exception:
+                    logger.exception("Failed to lazily rebuild memory retrieval index for scope %r", key)
+                    continue
+                if result.get("supported") and not result.get("failed"):
+                    self._retrieval_warmed_scopes.add(key)
 
     # ── Manage ───────────────────────────────────────────────────────────
     def get_memory(

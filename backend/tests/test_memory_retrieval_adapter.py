@@ -62,6 +62,15 @@ def test_warm_retrieval_rebuilds_the_complete_index(tmp_path: Path) -> None:
     assert any(fact["id"] == fact_id for fact in manager.search("warm", user_id="alice"))
 
 
+def test_lazy_warm_rebuilds_each_requested_scope(tmp_path: Path) -> None:
+    manager = DeerMem(backend_config={"storage_path": str(tmp_path), "token_counting": "char"})
+    calls: list[list[dict[str, str | None]]] = []
+    manager._storage.rebuild_index = lambda scopes=None: calls.append(scopes or []) or {"supported": True, "failed": 0}  # type: ignore[method-assign]
+    scopes = [{"userId": "alice", "agentName": "a"}, {"userId": "bob", "agentName": "b"}]
+    manager._ensure_retrieval_scopes(scopes)
+    assert calls == [[scopes[0]], [scopes[1]]]
+
+
 def test_adapter_isolates_scopes_even_when_fact_ids_repeat(tmp_path: Path) -> None:
     adapter = FTS5RetrievalAdapter(tmp_path / "facts.sqlite3")
     try:
