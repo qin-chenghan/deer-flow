@@ -361,6 +361,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # session close + this drain + buffer), set on the gateway Helm
         # deployment -- or K8s SIGKILLs the drain mid-flight and the loss this
         # is fixing is silently re-introduced.
+        manager = None
         try:
             app_cfg = get_app_config()
             if app_cfg.memory.enabled:
@@ -376,11 +377,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                         "Memory queue flush did not finish within %.1fs; remaining updates may be lost",
                         flush_timeout,
                     )
-                close = getattr(manager, "close", None)
-                if callable(close):
-                    await asyncio.to_thread(close)
         except Exception:
             logger.exception("Failed to flush memory queue on shutdown")
+        finally:
+            close = getattr(manager, "close", None)
+            if callable(close):
+                try:
+                    await asyncio.to_thread(close)
+                except Exception:
+                    logger.exception("Failed to close memory backend on shutdown")
 
     logger.info("Shutting down API Gateway")
 

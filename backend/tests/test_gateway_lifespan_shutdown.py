@@ -116,7 +116,7 @@ def test_lifespan_sweeps_upload_staging_files_on_startup():
     stop_channel_service.assert_awaited_once()
 
 
-async def _run_lifespan_with_memory_flush(*, enabled: bool, flush_return: bool) -> MagicMock:
+async def _run_lifespan_with_memory_flush(*, enabled: bool, flush_return: bool | Exception) -> MagicMock:
     """Drive lifespan with a spied memory manager.shutdown_flush.
 
     Returns the manager mock so the caller can assert the shutdown flush was
@@ -146,7 +146,10 @@ async def _run_lifespan_with_memory_flush(*, enabled: bool, flush_return: bool) 
         return fake_service
 
     manager = MagicMock()
-    manager.shutdown_flush.return_value = flush_return
+    if isinstance(flush_return, Exception):
+        manager.shutdown_flush.side_effect = flush_return
+    else:
+        manager.shutdown_flush.return_value = flush_return
 
     with (
         patch("app.gateway.app.get_app_config", return_value=startup_config),
@@ -189,6 +192,13 @@ def test_lifespan_skips_memory_flush_when_disabled() -> None:
     """memory.enabled=False skips the drain entirely."""
     manager = asyncio.run(_run_lifespan_with_memory_flush(enabled=False, flush_return=True))
     manager.shutdown_flush.assert_not_called()
+
+
+def test_lifespan_closes_memory_manager_when_flush_raises() -> None:
+    """Derived retrieval resources are released even when queue drain fails."""
+    manager = asyncio.run(_run_lifespan_with_memory_flush(enabled=True, flush_return=RuntimeError("flush failed")))
+    manager.shutdown_flush.assert_called_once_with(5.0)
+    manager.close.assert_called_once_with()
 
 
 # ── startup warm-up log accuracy ────────────────────────────────────────────
