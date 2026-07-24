@@ -114,9 +114,13 @@ class FTS5Retrieval:
         #      the lock via the public API and not bypass into ``self._conn``.
         self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
         self._lock = threading.RLock()
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA busy_timeout=30000")
-        self._init_schema()
+        try:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA busy_timeout=30000")
+            self._init_schema()
+        except Exception:
+            self._conn.close()
+            raise
 
     def _init_schema(self) -> None:
         conn = self._conn
@@ -680,6 +684,19 @@ def create_fts5_retrieval(config: Any) -> FTS5RetrievalAdapter | None:
         db_path = index_dir / "memory-fts5.sqlite3"
     try:
         return FTS5RetrievalAdapter(db_path)
-    except sqlite3.OperationalError as exc:
-        logger.warning("SQLite FTS5 is unavailable; DeerMem will use substring retrieval: %s", exc)
-        return None
+    except sqlite3.DatabaseError as exc:
+        if db_path == ":memory:":
+            logger.warning("SQLite FTS5 is unavailable; DeerMem will use substring retrieval: %s", exc)
+            return None
+
+        logger.warning("Derived memory retrieval index is invalid; recreating it: %s", exc)
+        try:
+            for path in (Path(db_path), Path(f"{db_path}-wal"), Path(f"{db_path}-shm")):
+                path.unlink(missing_ok=True)
+            return FTS5RetrievalAdapter(db_path)
+        except (OSError, sqlite3.DatabaseError) as retry_exc:
+            logger.warning(
+                "SQLite FTS5 index recreation failed; DeerMem will use substring retrieval: %s",
+                retry_exc,
+            )
+            return None

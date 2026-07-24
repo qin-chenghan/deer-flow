@@ -14,6 +14,7 @@ from deerflow.agents.memory.backends.deermem.deermem.core.retrieval import (
     FTS5RetrievalAdapter,
     _is_advanced_query,
     _jieba_available,
+    create_fts5_retrieval,
 )
 from deerflow.agents.memory.backends.deermem.deermem.core.storage import FileMemoryStorage
 
@@ -74,6 +75,32 @@ def test_lazy_warm_rebuilds_each_requested_scope(tmp_path: Path) -> None:
 def test_deermem_close_releases_retrieval_connection(tmp_path: Path) -> None:
     manager = DeerMem(backend_config={"storage_path": str(tmp_path), "token_counting": "char"})
     manager.close()
+
+
+def test_factory_recreates_corrupt_persistent_index(tmp_path: Path) -> None:
+    index_dir = tmp_path / ".retrieval"
+    index_dir.mkdir()
+    db_path = index_dir / "memory-fts5.sqlite3"
+    db_path.write_bytes(b"not a sqlite database")
+
+    adapter = create_fts5_retrieval(DeerMemConfig(storage_path=str(tmp_path)))
+
+    assert adapter is not None
+    try:
+        adapter.upsert(
+            _fact("recovered", "recreated derived index"),
+            scope={"userId": "alice", "agentName": "agent-a"},
+            path="",
+        )
+        assert adapter.search(
+            "recreated",
+            scopes=[{"userId": "alice", "agentName": "agent-a"}],
+            top_k=5,
+            mode="fts5",
+            filters=None,
+        )
+    finally:
+        adapter.close()
 
 
 def test_adapter_isolates_scopes_even_when_fact_ids_repeat(tmp_path: Path) -> None:
