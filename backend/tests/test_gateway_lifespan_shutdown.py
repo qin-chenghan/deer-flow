@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -266,3 +267,51 @@ def test_lifespan_warns_when_warm_returns_false(caplog) -> None:
     manager = asyncio.run(_run_lifespan_with_warm_return(False))
     manager.warm.assert_called_once_with()
     assert any(r.levelno == logging.WARNING and "warm-up failed" in r.message for r in caplog.records)
+
+
+async def _run_lifespan_with_slow_retrieval_warm() -> float:
+    from app.gateway.app import lifespan
+
+    app = FastAPI()
+    startup_config = SimpleNamespace(
+        log_level="INFO",
+        memory=SimpleNamespace(
+            token_counting="char",
+            enabled=True,
+            shutdown_flush_timeout_seconds=5.0,
+        ),
+    )
+    fake_service = MagicMock()
+    fake_service.get_status.return_value = {}
+    release_rebuild = threading.Event()
+    manager = MagicMock()
+    manager.warm_retrieval.side_effect = lambda: release_rebuild.wait(5.0) or True
+    manager.warm.return_value = True
+    manager.shutdown_flush.return_value = True
+
+    async def fake_start(_startup_config):
+        return fake_service
+
+    with (
+        patch("app.gateway.app.get_app_config", return_value=startup_config),
+        patch("app.gateway.app.get_gateway_config", return_value=MagicMock(host="x", port=0)),
+        patch("app.gateway.app.langgraph_runtime", _noop_langgraph_runtime),
+        patch("app.gateway.app.auth.close_oidc_service", AsyncMock()),
+        patch("app.channels.service.start_channel_service", side_effect=fake_start),
+        patch("app.channels.service.stop_channel_service", AsyncMock()),
+        patch("deerflow.agents.memory.get_memory_manager", return_value=manager),
+    ):
+        context = lifespan(app)
+        loop = asyncio.get_running_loop()
+        started_at = loop.time()
+        try:
+            await asyncio.wait_for(context.__aenter__(), timeout=1.0)
+            startup_elapsed = loop.time() - started_at
+        finally:
+            release_rebuild.set()
+        await context.__aexit__(None, None, None)
+    return startup_elapsed
+
+
+def test_lifespan_does_not_wait_for_retrieval_rebuild_before_serving() -> None:
+    assert asyncio.run(_run_lifespan_with_slow_retrieval_warm()) < 1.0

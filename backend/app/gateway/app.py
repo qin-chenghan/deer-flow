@@ -169,6 +169,18 @@ async def _migrate_orphaned_threads(store, admin_user_id: str) -> int:
     return migrated
 
 
+async def _warm_memory_retrieval(manager) -> None:
+    """Rebuild the derived retrieval index without delaying Gateway readiness."""
+    try:
+        rebuilt = await asyncio.to_thread(manager.warm_retrieval)
+        if rebuilt:
+            logger.info("Memory retrieval index rebuilt successfully")
+        else:
+            logger.warning("Memory retrieval index rebuild failed; scoped searches will retry lazily")
+    except Exception:
+        logger.warning("Memory retrieval index rebuild skipped", exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Application lifespan handler."""
@@ -203,10 +215,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception:  # observability must never break startup
         logger.exception("Monocle tracing setup failed; continuing without it")
 
-    # Rebuild the derived memory retrieval index before serving requests. This
-    # is separate from the short tiktoken probe below: an index rebuild may
-    # legitimately scan many users and must not be abandoned after five
-    # seconds while its worker thread is still mutating the shared index.
+    # Rebuild the derived memory retrieval index in the background. Scoped
+    # searches remain correct while this runs because DeerMem lazily rebuilds
+    # the requested scope when the full warm-up has not completed yet.
+    retrieval_warm_task: asyncio.Task[None] | None = None
     try:
         from deerflow.agents.memory import get_memory_manager
 
@@ -214,11 +226,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             manager = get_memory_manager()
             warm_retrieval = getattr(manager, "warm_retrieval", None)
             if callable(warm_retrieval):
-                rebuilt = await asyncio.to_thread(warm_retrieval)
-                if rebuilt:
-                    logger.info("Memory retrieval index rebuilt successfully")
-                else:
-                    logger.warning("Memory retrieval index rebuild failed; scoped searches will retry lazily")
+                retrieval_warm_task = asyncio.create_task(
+                    _warm_memory_retrieval(manager),
+                    name="memory-retrieval-warm-up",
+                )
         else:
             logger.info("Memory is disabled; skipping retrieval index rebuild")
     except Exception:
@@ -361,6 +372,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # session close + this drain + buffer), set on the gateway Helm
         # deployment -- or K8s SIGKILLs the drain mid-flight and the loss this
         # is fixing is silently re-introduced.
+        retrieval_warm_finished = True
+        if retrieval_warm_task is not None and not retrieval_warm_task.done():
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(retrieval_warm_task),
+                    timeout=startup_config.memory.shutdown_flush_timeout_seconds,
+                )
+            except TimeoutError:
+                retrieval_warm_finished = False
+                logger.warning("Memory retrieval index rebuild is still running; leaving its connection open during shutdown")
+
         manager = None
         try:
             app_cfg = get_app_config()
@@ -381,7 +403,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             logger.exception("Failed to flush memory queue on shutdown")
         finally:
             close = getattr(manager, "close", None)
-            if callable(close):
+            if callable(close) and retrieval_warm_finished:
                 try:
                     await asyncio.to_thread(close)
                 except Exception:
