@@ -1481,6 +1481,7 @@ class FileMemoryStorage(MemoryStorage):
             except Exception:
                 logger.exception("Failed to atomically rebuild retrieval index")
                 failed += len(records) or 1
+                return {"supported": True, "indexed": indexed, "failed": failed, "fatal": True}
         else:
             clear = getattr(self._retrieval, "clear", None)
             if callable(clear):

@@ -482,7 +482,13 @@ class DeerMem(MemoryManager):
             return True
         try:
             result = rebuild()
-            index_ok = not bool(result.get("failed"))
+            index_ok = not bool(result.get("fatal"))
+            failed = int(result.get("failed") or 0)
+            if failed and index_ok:
+                logger.warning(
+                    "Memory retrieval index rebuilt with %d fact(s) skipped",
+                    failed,
+                )
             if index_ok:
                 with self._retrieval_lock:
                     self._retrieval_fully_warmed = True

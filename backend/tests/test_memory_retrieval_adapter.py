@@ -63,6 +63,22 @@ def test_warm_retrieval_rebuilds_the_complete_index(tmp_path: Path) -> None:
     assert any(fact["id"] == fact_id for fact in manager.search("warm", user_id="alice"))
 
 
+def test_warm_retrieval_accepts_partial_fact_failures(tmp_path: Path) -> None:
+    manager = DeerMem(backend_config={"storage_path": str(tmp_path), "token_counting": "char"})
+    manager._storage.rebuild_index = lambda scopes=None: {"supported": True, "indexed": 2, "failed": 1}  # type: ignore[method-assign]
+
+    assert manager.warm_retrieval()
+    assert manager._retrieval_fully_warmed
+
+
+def test_warm_retrieval_retries_after_fatal_rebuild_failure(tmp_path: Path) -> None:
+    manager = DeerMem(backend_config={"storage_path": str(tmp_path), "token_counting": "char"})
+    manager._storage.rebuild_index = lambda scopes=None: {"supported": True, "indexed": 0, "failed": 1, "fatal": True}  # type: ignore[method-assign]
+
+    assert not manager.warm_retrieval()
+    assert not manager._retrieval_fully_warmed
+
+
 def test_lazy_warm_rebuilds_each_requested_scope(tmp_path: Path) -> None:
     manager = DeerMem(backend_config={"storage_path": str(tmp_path), "token_counting": "char"})
     calls: list[list[dict[str, str | None]]] = []
